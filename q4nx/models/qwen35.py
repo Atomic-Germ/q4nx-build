@@ -227,20 +227,40 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
     _Q8_0_NAMES = {"lm_head", "ssm_out_proj", "ssm_alpha_proj", "ssm_beta_proj"}
 
     def _store_q(self, q4nx_name: str, w: torch.Tensor):
-        """Quantize + pack a 2D weight into the Q4NX block layout."""
+        """Quantize + pack a 2D weight into the Q4NX block layout.
+
+        To match the GGUF-derived reference, Q4_1-target tensors are quantized
+        through an intermediate Q8_0 pass: the Q4_1 quantization is performed on
+        the dequantized Q8_0 values, carrying the same round-trip error a Q8_0
+        GGUF source would introduce. This makes the HF path produce identical
+        bytes to the GGUF path for the same upstream weights.
+        """
         target = (
             GGMLQuantizationType.Q8_0
             if any(n in q4nx_name for n in self._Q8_0_NAMES)
             else GGMLQuantizationType.Q4_1
         )
         w_np = w.to(torch.float32).numpy()
-        quantized = quantize(w_np, target).copy()
         columns = w_np.shape[1]
+        # Quantize to Q8_0 first (intermediate, matches GGUF reference)
+        q80 = quantize(w_np, GGMLQuantizationType.Q8_0).copy()
+        # Dequantize back to float; this is what the GGUF path operates on
+        w_deq = dequantize(q80, GGMLQuantizationType.Q8_0)
+        w_deq = torch.from_numpy(w_deq).contiguous().to(torch.bfloat16)
+        w_deq = w_deq.to(torch.float32).numpy()
         if target == GGMLQuantizationType.Q4_1:
+            quantized = quantize(w_deq, target).copy()
             d, m, qw = GGUFTensor.unpack_q4_1(quantized, columns)
+            # Apply the q_proj reorder to the unpacked blocks (matches GGUF path,
+            # which reorders after unpacking rather than on the raw weight).
+            if "self_attn.q_proj" in q4nx_name and self.head_dim is not None:
+                DH = self.head_dim
+                d = rearrange(d, '(g p h) c -> (p g h) c', p=2, h=DH).contiguous()
+                m = rearrange(m, '(g p h) c -> (p g h) c', p=2, h=DH).contiguous()
+                qw = rearrange(qw, '(g p h) c -> (p g h) c', p=2, h=DH).contiguous()
             self.q4nx_tensors[q4nx_name] = self._pack(d, m, qw, tensor_type=target)
         else:
-            d, _, qw = GGUFTensor.unpack_q8_0(quantized, columns)
+            d, _, qw = GGUFTensor.unpack_q8_0(q80, columns)
             self.q4nx_tensors[q4nx_name] = self._pack(d, None, qw, tensor_type=target)
 
     def _convert_hf_language(self, q4nx_path: str):
@@ -313,8 +333,12 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
         if config_path.is_file():
             with open(config_path) as f:
                 cfg = json.load(f)
-            head_dim = cfg.get("head_dim") or cfg.get("attention_value_length")
-            ssm_state_size = cfg.get("ssm_state_size") or cfg.get("conv_kernel_size")
+            text_cfg = cfg.get("text_config", {})
+            head_dim = cfg.get("head_dim") or cfg.get("attention_value_length") \
+                or text_cfg.get("head_dim") or text_cfg.get("attention_value_length")
+            ssm_state_size = cfg.get("ssm_state_size") or cfg.get("conv_kernel_size") \
+                or text_cfg.get("ssm_state_size") or text_cfg.get("conv_kernel_size")
+        self.head_dim = head_dim
 
         reorder_linear = ssm_state_size is not None and ssm_state_size > 6144
 
@@ -343,14 +367,16 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
             if any(key.endswith(s) for s in (".weight", ".bias")) and \
                any(p in key for p in ("layernorm", "norm", "_norm")):
                 w = w.to(torch.bfloat16)
-                if "ssm_norm" not in key:
+                if "ssm_norm" not in q4nx_name:
                     w = (w.float() + 1).to(torch.bfloat16)
                 self.q4nx_tensors[q4nx_name] = w
                 continue
 
             # ssm_a and ssm_dt.bias are stored as float32 (not quantized)
             if "linear_attn.ssm_a" in q4nx_name and q4nx_name.endswith("ssm_a"):
-                w = w.float()
+                # HF stores A_log (the raw log-magnitude parameter); the GGUF
+                # convention (and Q4NX runtime) expects A = -exp(A_log).
+                w = -torch.exp(w.float())
                 if reorder_linear:
                     w = rearrange(w, '(q g) -> (g q)', q=2).contiguous()
                 self.q4nx_tensors[q4nx_name] = w
@@ -370,9 +396,6 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                     w = w.T.contiguous()
                 self.q4nx_tensors[q4nx_name] = w.to(torch.bfloat16)
                 continue
-
-            if "self_attn.q_proj.weight" in q4nx_name and head_dim is not None:
-                w = rearrange(w, '(g p h) c -> (p g h) c', p=2, h=head_dim).contiguous()
 
             if reorder_linear:
                 if "linear_attn.in_proj_qkv.weight" in key and ssm_state_size is not None:
@@ -400,7 +423,13 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
 
             # Alpha/beta: store bf16 variant + quantized variant
             if "linear_attn.ssm_alpha_proj.weight" in q4nx_name or "linear_attn.ssm_beta_proj.weight" in q4nx_name:
-                w_bf16 = w.clone()
+                # The bf16 variant is derived from the Q8_0 dequantization,
+                # matching the GGUF path (which dequantizes the Q8_0 source
+                # rather than keeping the original HF bf16).
+                w_np = w.to(torch.float32).numpy()
+                q80 = quantize(w_np, GGMLQuantizationType.Q8_0).copy()
+                w_bf16 = dequantize(q80, GGMLQuantizationType.Q8_0)
+                w_bf16 = torch.from_numpy(w_bf16).contiguous().to(torch.bfloat16)
                 if reorder_linear:
                     w_bf16 = rearrange(w_bf16, '(q g) c -> (g q) c', q=2).contiguous()
                 bf16_name = q4nx_name.replace("alpha_proj", "alpha_proj.bf16").replace("beta_proj", "beta_proj.bf16")
