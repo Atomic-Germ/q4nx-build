@@ -64,8 +64,11 @@ class __Q4NX_Converter(ABC):
         _MODEL_REGISTRY[model_arch] = cls
 
     def initialize(self):
-        self._read_gguf_tensors()
-        self._read_gguf_metadata()
+        if self.gguf_reader is not None:
+            self._read_gguf_tensors()
+            self._read_gguf_metadata()
+        else:
+            self._read_hf_index()
         self._load_config()
 
     @abstractmethod
@@ -1269,6 +1272,19 @@ def _detect_hf_arch(hf_source: str) -> ModelArch | None:
         if os.path.isfile(candidate):
             config_path = candidate
     if config_path is None:
+        # Try downloading from HF hub
+        try:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(repo_id=hf_source, filename="config.json")
+            if path:
+                config_path = path
+        except Exception:
+            pass
+    if config_path is None:
+        # Try README base_model fallback before giving up
+        base_arch = _detect_arch_from_readme_base_model(hf_source)
+        if base_arch is not None:
+            return base_arch
         return ModelArch.QWEN35MOE  # legacy fallback
     with open(config_path) as f:
         cfg = json.load(f)
@@ -1279,10 +1295,10 @@ def _detect_hf_arch(hf_source: str) -> ModelArch | None:
         for name in arch_names:
             if arch_str == name.lower():
                 return arch_enum
-    for arch_str in architectures:
+    for arch_candidate in architectures:
         for arch_enum, arch_names in ModelArchNames.items():
             for name in arch_names:
-                if arch_str.lower() == name.lower():
+                if arch_candidate.lower() == name.lower():
                     return arch_enum
     if arch_str in ("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_6_moe", "qwen3_6_moe_text"):
         return ModelArch.QWEN35MOE
@@ -1291,8 +1307,16 @@ def _detect_hf_arch(hf_source: str) -> ModelArch | None:
         for variant, expected_dim in QWEN35_VARIANT_DIMS.items():
             if hidden_size == expected_dim:
                 return variant
+        # hidden_size missing or unrecognized — try README base_model
+        base_arch = _detect_arch_from_readme_base_model(hf_source)
+        if base_arch is not None:
+            return base_arch
         return ModelArch.QWEN35_4B
     if arch_str == "qwen3":
+        # config.json says qwen3 but could be a qwen3.5 derivative — check README
+        base_arch = _detect_arch_from_readme_base_model(hf_source)
+        if base_arch is not None:
+            return base_arch
         return ModelArch.QWEN3
     if arch_str in ("qwen2", "qwen2.5"):
         return ModelArch.QWEN2
@@ -1314,4 +1338,157 @@ def _detect_hf_arch(hf_source: str) -> ModelArch | None:
         return ModelArch.GPT_OSS
     if arch_str in ("nanbeige",):
         return ModelArch.NANBEIGE
+    return None
+
+
+def _parse_readme_frontmatter(hf_source: str) -> dict:
+    """Parse YAML frontmatter from README.md in an HF repo or local dir."""
+    import os
+    readme_text = None
+    if os.path.isdir(hf_source):
+        readme_path = os.path.join(hf_source, "README.md")
+        if os.path.isfile(readme_path):
+            try:
+                with open(readme_path, encoding="utf-8", errors="replace") as f:
+                    readme_text = f.read()
+            except Exception:
+                return {}
+    if readme_text is None:
+        # Try downloading from HF hub
+        try:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(repo_id=hf_source, filename="README.md")
+            if path:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    readme_text = f.read()
+        except Exception:
+            return {}
+    if readme_text is None:
+        return {}
+    # Extract YAML frontmatter between --- delimiters
+    if not readme_text.startswith("---"):
+        return {}
+    end = readme_text.find("---", 3)
+    if end == -1:
+        return {}
+    try:
+        import yaml
+        return yaml.safe_load(readme_text[3:end]) or {}
+    except Exception:
+        return {}
+
+
+def _detect_arch_from_readme_base_model(hf_source: str) -> ModelArch | None:
+    """Try to detect architecture from README.md's base_model field."""
+    import os
+    from .model_assets import _hf_download_file, cached_snapshot_dir
+    fm = _parse_readme_frontmatter(hf_source)
+    base_model = fm.get("base_model")
+    if not base_model:
+        return None
+    if isinstance(base_model, list):
+        base_model = base_model[0] if base_model else None
+    if not base_model or not isinstance(base_model, str):
+        return None
+    base_model = base_model.strip()
+    print(f"[INFO] README base_model: {base_model}")
+    # Try to find config.json for the base model
+    # First check if it's a local path
+    base_config_path = None
+    if os.path.isdir(base_model):
+        candidate = os.path.join(base_model, "config.json")
+        if os.path.isfile(candidate):
+            base_config_path = candidate
+    # Try HF cache
+    if base_config_path is None:
+        snap = cached_snapshot_dir(base_model)
+        if snap:
+            candidate = snap / "config.json"
+            if candidate.is_file():
+                base_config_path = str(candidate)
+    # Try downloading
+    if base_config_path is None:
+        try:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(repo_id=base_model, filename="config.json")
+            if path:
+                base_config_path = path
+        except Exception:
+            pass
+    if base_config_path is None:
+        print(f"[WARN] Could not find config.json for base_model {base_model}")
+        return None
+    with open(base_config_path) as f:
+        cfg = json.load(f)
+    model_type = cfg.get("model_type", "")
+    architectures = cfg.get("architectures", [])
+    arch_str = model_type.lower() if model_type else ""
+    # Try matching model_type
+    for arch_enum, arch_names in ModelArchNames.items():
+        for name in arch_names:
+            if arch_str == name.lower():
+                return arch_enum
+    # Try matching architectures
+    for arch_candidate in architectures:
+        for arch_enum, arch_names in ModelArchNames.items():
+            for name in arch_names:
+                if arch_candidate.lower() == name.lower():
+                    return arch_enum
+    # Try specific patterns
+    if arch_str in ("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_6_moe", "qwen3_6_moe_text"):
+        return ModelArch.QWEN35MOE
+    if arch_str in ("qwen3_5", "qwen35"):
+        hidden_size = cfg.get("hidden_size", 0)
+        for variant, expected_dim in QWEN35_VARIANT_DIMS.items():
+            if hidden_size == expected_dim:
+                return variant
+        # Try to infer variant from base_model name
+        return _infer_qwen35_variant_from_name(base_model)
+    if arch_str == "qwen3":
+        return ModelArch.QWEN3
+    if arch_str in ("qwen2", "qwen2.5"):
+        return ModelArch.QWEN2
+    if arch_str in ("qwen2_vl", "qwen2.5_vl"):
+        return ModelArch.QWEN2VL
+    if arch_str in ("qwen3_vl",):
+        return ModelArch.QWEN3VL
+    if arch_str in ("llama",):
+        return ModelArch.LLAMA
+    if arch_str in ("phi3", "phi4"):
+        return ModelArch.PHI4
+    if arch_str in ("gemma3",):
+        return ModelArch.GEMMA3
+    if arch_str in ("gemma4",):
+        return ModelArch.GEMMA4
+    if arch_str in ("lfm", "lfm2"):
+        return ModelArch.LFM2
+    if arch_str in ("gpt_oss", "gpt-oss"):
+        return ModelArch.GPT_OSS
+    if arch_str in ("nanbeige",):
+        return ModelArch.NANBEIGE
+    return None
+
+
+def _infer_qwen35_variant_from_name(name: str) -> ModelArch | None:
+    """Infer qwen3.5 variant from a model name/repo id by size suffix."""
+    import re
+    name_lower = name.lower()
+    # Match patterns like "qwen3.5-9b", "qwen35-9b", "Qwen3.5-9B"
+    m = re.search(r'qwen3[\._]?5.*?[-_](\d+\.?\d*)b', name_lower)
+    if not m:
+        return None
+    size_str = m.group(1)
+    try:
+        size_b = float(size_str)
+    except ValueError:
+        return None
+    # Match to known variants by size
+    if size_b < 1.0:
+        return ModelArch.QWEN35_08B
+    elif size_b <= 2.5:
+        return ModelArch.QWEN35_2B
+    elif size_b <= 4.5:
+        return ModelArch.QWEN35_4B
+    elif size_b <= 10:
+        return ModelArch.QWEN35_9B
     return None

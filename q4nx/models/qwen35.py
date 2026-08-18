@@ -2,6 +2,7 @@ from pprint import pp
 
 from ..model_converter import __Q4NX_Converter
 from ..constants import ModelArch, ModelArchNames
+from ..gguf_tensor import GGUFTensor
 from gguf import GGUFReader, dequantize, quantize, GGMLQuantizationType
 from safetensors.torch import save_file
 from einops import rearrange, repeat
@@ -28,7 +29,12 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
             self.initialize(config_json_path=config_json_path)
 
     def initialize(self, config_json_path=None):
-        super().initialize()
+        self._load_config(config_file_path=config_json_path)
+        if self.gguf_reader is not None:
+            self._read_gguf_tensors()
+            self._read_gguf_metadata()
+        else:
+            self._read_hf_index()
 
     def convert(self, q4nx_path: str, weights_type: str = 'language'):
         self.q4nx_tensors = {}
@@ -218,9 +224,42 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
         else:
             raise ValueError(f"Unsupported weights_type: {weights_type} for Qwen35 HF conversion")
 
+    _Q8_0_NAMES = {"lm_head", "ssm_out_proj", "ssm_alpha_proj", "ssm_beta_proj"}
+
+    def _store_q(self, q4nx_name: str, w: torch.Tensor):
+        """Quantize + pack a 2D weight into the Q4NX block layout."""
+        target = (
+            GGMLQuantizationType.Q8_0
+            if any(n in q4nx_name for n in self._Q8_0_NAMES)
+            else GGMLQuantizationType.Q4_1
+        )
+        w_np = w.to(torch.float32).numpy()
+        quantized = quantize(w_np, target).copy()
+        columns = w_np.shape[1]
+        if target == GGMLQuantizationType.Q4_1:
+            d, m, qw = GGUFTensor.unpack_q4_1(quantized, columns)
+            self.q4nx_tensors[q4nx_name] = self._pack(d, m, qw, tensor_type=target)
+        else:
+            d, _, qw = GGUFTensor.unpack_q8_0(quantized, columns)
+            self.q4nx_tensors[q4nx_name] = self._pack(d, None, qw, tensor_type=target)
+
     def _convert_hf_language(self, q4nx_path: str):
         import re
         self.q4nx_tensors = {}
+        # Explicit HF -> Q4NX name mapping for linear_attn tensors whose
+        # HF names (in_proj_*, out_proj, A_log, dt_bias, norm) differ from
+        # the Q4NX config names (qkv_proj, ssm_*, etc.)
+        _HF_TO_Q4NX_LINEAR = {
+            "linear_attn.in_proj_qkv.weight": "linear_attn.qkv_proj.weight",
+            "linear_attn.in_proj_z.weight": "self_attn.gate_proj.weight",
+            "linear_attn.in_proj_a.weight": "linear_attn.ssm_alpha_proj.weight",
+            "linear_attn.in_proj_b.weight": "linear_attn.ssm_beta_proj.weight",
+            "linear_attn.out_proj.weight": "linear_attn.ssm_out_proj.weight",
+            "linear_attn.conv1d.weight": "linear_attn.ssm_conv1d.weight",
+            "linear_attn.A_log": "linear_attn.ssm_a",
+            "linear_attn.dt_bias": "linear_attn.ssm_dt.bias",
+            "linear_attn.norm.weight": "linear_attn.ssm_norm.weight",
+        }
         # Build HF name map with {bid} expanded to actual layer numbers.
         # HF names have prefix model.language_model.layers.{bid}.X
         # Q4NX names have prefix model.layers.{bid}.X
@@ -231,21 +270,42 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
             q4nx_name = param_info["q4nx_name"]
             if "rope_freqs" in q4nx_name:
                 continue
+            # HF names strip model.language_model. prefix, so keys become
+            # layers.{bid}.X or embed_tokens.weight etc.
+            # Q4NX names have model.layers.{bid}.X or model.embed_tokens.weight
+            # We strip model. prefix so the map keys match the stripped HF keys.
+            # Exception: visual/audio tensors keep model. prefix since HF has model.visual.*
+            is_vision = "visual" in q4nx_name
+            is_audio = "audio" in q4nx_name
+            stripped = q4nx_name if (is_vision or is_audio) else q4nx_name.replace("model.", "", 1)
             if "{bid}" in q4nx_name:
-                # Strip 'model.' prefix so it matches stripped HF key (layers.{bid}.X)
-                stripped = q4nx_name.replace("model.", "", 1)
-                pattern = re.escape(stripped).replace(r"\{bid\}", r"(\d+)")
+                # For linear_attn entries, find the matching HF name
+                hf_suffix = None
+                for hf_pat, q4nx_suf in _HF_TO_Q4NX_LINEAR.items():
+                    if stripped.endswith(q4nx_suf):
+                        hf_suffix = hf_pat
+                        break
+                if hf_suffix is not None:
+                    # Replace Q4NX suffix with HF suffix: layers.{bid}.linear_attn.qkv_proj.weight
+                    # becomes layers.{bid}.linear_attn.in_proj_qkv.weight
+                    hf_stripped = stripped[:-len(next(s for s in _HF_TO_Q4NX_LINEAR.values() if stripped.endswith(s)))] + hf_suffix
+                    pattern = re.escape(hf_stripped).replace(r"\{bid\}", r"(\d+)")
+                else:
+                    pattern = re.escape(stripped).replace(r"\{bid\}", r"(\d+)")
                 found = sorted(set(
                     int(m.group(1))
                     for n in self.weight_map
                     if (m := re.match("^" + pattern + "$", n.replace("model.language_model.", "")))
                 ))
                 for bid in found:
-                    hf_key = stripped.format(bid=bid)
+                    if hf_suffix is not None:
+                        hf_key = hf_stripped.format(bid=bid)
+                    else:
+                        hf_key = stripped.format(bid=bid)
                     q4nx_key = q4nx_name.format(bid=bid)
                     hf_name_map[hf_key] = q4nx_key
             else:
-                hf_name_map[q4nx_name] = q4nx_name
+                hf_name_map[stripped] = q4nx_name
 
         config_path = self.hf_dir / "config.json"
         head_dim = None
@@ -260,7 +320,9 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
 
         for name in sorted(self.weight_map):
             key = name.replace("model.language_model.", "")
-            if ".nextn." in key:
+            if ".nextn." in key or key.startswith("mtp."):
+                continue
+            if key.startswith("model.visual.") or key.startswith("model.audio."):
                 continue
             if key not in hf_name_map:
                 print(f"[WARN] Unmapped HF tensor: {name}")
@@ -268,14 +330,48 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
             w = self._load_tensor(name)
             q4nx_name = hf_name_map[key]
 
-            if key == "model.embed_tokens.weight":
+            if key == "embed_tokens.weight":
                 self.q4nx_tensors[q4nx_name] = w.to(torch.bfloat16)
                 continue
             if key == "lm_head.weight":
+                self._store_q(q4nx_name, w)
+                continue
+
+            # Norm/bias weights are stored as bf16.
+            # Layernorm convention: engine expects weight + 1 (llama.cpp convention),
+            # except ssm_norm which is stored raw.
+            if any(key.endswith(s) for s in (".weight", ".bias")) and \
+               any(p in key for p in ("layernorm", "norm", "_norm")):
+                w = w.to(torch.bfloat16)
+                if "ssm_norm" not in key:
+                    w = (w.float() + 1).to(torch.bfloat16)
                 self.q4nx_tensors[q4nx_name] = w
                 continue
 
-            if "self_attn.q_proj.weight" in key and head_dim is not None:
+            # ssm_a and ssm_dt.bias are stored as float32 (not quantized)
+            if "linear_attn.ssm_a" in q4nx_name and q4nx_name.endswith("ssm_a"):
+                w = w.float()
+                if reorder_linear:
+                    w = rearrange(w, '(q g) -> (g q)', q=2).contiguous()
+                self.q4nx_tensors[q4nx_name] = w
+                continue
+
+            if "linear_attn.ssm_dt.bias" in q4nx_name:
+                w = w.float()
+                if reorder_linear:
+                    w = rearrange(w, '(q g) -> (g q)', q=2).contiguous()
+                self.q4nx_tensors[q4nx_name] = w
+                continue
+
+            # conv1d: squeeze + transpose to 2D
+            if "linear_attn.ssm_conv1d.weight" in q4nx_name:
+                w = w.squeeze()
+                if w.dim() == 2:
+                    w = w.T.contiguous()
+                self.q4nx_tensors[q4nx_name] = w.to(torch.bfloat16)
+                continue
+
+            if "self_attn.q_proj.weight" in q4nx_name and head_dim is not None:
                 w = rearrange(w, '(g p h) c -> (p g h) c', p=2, h=head_dim).contiguous()
 
             if reorder_linear:
@@ -286,22 +382,15 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                     w1 = rearrange(w1, '(q g p) c -> (g q p) c', p=ssm_state_size, q=2).contiguous()
                     w = torch.cat([w0, w1], dim=0).contiguous()
 
-                if "self_attn.gate_proj.weight" in key and ssm_state_size is not None:
+                if "self_attn.gate_proj.weight" in q4nx_name and ssm_state_size is not None:
                     w = rearrange(w, '(q g p) c -> (g q p) c', p=ssm_state_size, q=2).contiguous()
 
-                if "linear_attn.ssm_out_proj.weight" in key and ssm_state_size is not None:
+                if "linear_attn.ssm_out_proj.weight" in q4nx_name and ssm_state_size is not None:
                     DH = ssm_state_size // 32
                     BLOCK_SIZE = 32
                     w = rearrange(w, 'r (q g p) -> r (g q p)', p=DH, q=2).contiguous()
 
-                if "linear_attn.ssm_alpha_proj.weight" in key or "linear_attn.ssm_beta_proj.weight" in key:
-                    w = rearrange(w, '(q g) c -> (g q) c', q=2).contiguous()
-                    bf16_name = q4nx_name.replace("alpha_proj", "alpha_proj.bf16").replace("beta_proj", "beta_proj.bf16")
-                    self.q4nx_tensors[bf16_name] = w
-                    if w.shape[0] < 32:
-                        w = repeat(w, 'd c -> (r d) c', r=2).contiguous()
-
-                if "linear_attn.ssm_conv1d.weight" in key and ssm_state_size is not None:
+                if "linear_attn.ssm_conv1d.weight" in q4nx_name and ssm_state_size is not None:
                     d_half = w.shape[0] // 2
                     w0 = w[:d_half]
                     w1 = w[d_half:]
@@ -309,15 +398,22 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                     w = torch.cat([w0, w1], dim=0).contiguous()
                     w = w.T.contiguous()
 
-                if "linear_attn.ssm_a" in key and key.endswith("ssm_a"):
-                    w = w.float()
-                    w = rearrange(w, '(q g) -> (g q)', q=2).contiguous()
+            # Alpha/beta: store bf16 variant + quantized variant
+            if "linear_attn.ssm_alpha_proj.weight" in q4nx_name or "linear_attn.ssm_beta_proj.weight" in q4nx_name:
+                w_bf16 = w.clone()
+                if reorder_linear:
+                    w_bf16 = rearrange(w_bf16, '(q g) c -> (g q) c', q=2).contiguous()
+                bf16_name = q4nx_name.replace("alpha_proj", "alpha_proj.bf16").replace("beta_proj", "beta_proj.bf16")
+                self.q4nx_tensors[bf16_name] = w_bf16
+                w_q = w_bf16.clone()
+                if w_q.shape[0] < 32:
+                    w_q = repeat(w_q, 'd c -> (r d) c', r=2).contiguous()
+                self._store_q(q4nx_name, w_q)
+                continue
 
-                if "linear_attn.ssm_dt.bias" in key:
-                    w = w.float()
-                    w = rearrange(w, '(q g) -> (g q)', q=2).contiguous()
-
-            self.q4nx_tensors[q4nx_name] = w
+            if w.dim() < 2:
+                raise RuntimeError(f"1D tensor reached _store_q: {q4nx_name} key={key} shape={w.shape}")
+            self._store_q(q4nx_name, w)
 
         print(f"[INFO] Produced {len(self.q4nx_tensors)} Q4NX tensors")
         self._export_weights(q4nx_path, "language")
@@ -341,10 +437,12 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
             for bid in found:
                 concrete = q4nx_name.format(bid=bid)
                 hf_name_map[concrete] = concrete
-        # Add non-bid entries (patch_embed, merger, etc.)
+        # Add non-bid entries (patch_embed, merger, etc.) — visual only
         for param_info in self.q4nx_config["name_map"].values():
             q4nx_name = param_info["q4nx_name"]
             if "rope_freqs" in q4nx_name or "{bid}" in q4nx_name:
+                continue
+            if "visual" not in q4nx_name:
                 continue
             hf_name_map[q4nx_name] = q4nx_name
 
@@ -362,14 +460,16 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
 
             self.q4nx_tensors[q4nx_name] = w
 
-        combined_patched_embeding = torch.stack(
-            [self.q4nx_tensors["model.visual.patch_embed.proj.weight"],
-             self.q4nx_tensors["model.visual.patch_embed.proj.weight.1"]
-            ], dim=2
-        )
-        del self.q4nx_tensors["model.visual.patch_embed.proj.weight"]
-        del self.q4nx_tensors["model.visual.patch_embed.proj.weight.1"]
-        self.q4nx_tensors["model.visual.patch_embed.proj.weight"] = combined_patched_embeding
+        # HF source already has merged patch_embed weight [C, 3, 2, H, W].
+        # GGUF sources have two separate weights that need stacking.
+        pe = "model.visual.patch_embed.proj.weight"
+        pe1 = pe + ".1"
+        if pe in self.q4nx_tensors and pe1 in self.q4nx_tensors:
+            combined = torch.stack([self.q4nx_tensors[pe], self.q4nx_tensors[pe1]], dim=2)
+            del self.q4nx_tensors[pe]
+            del self.q4nx_tensors[pe1]
+            self.q4nx_tensors[pe] = combined
+        # If only `pe` exists and already has dim 2 == 2, it's pre-merged — leave as-is.
 
         print(f"[INFO] Produced {len(self.q4nx_tensors)} Q4NX vision tensors")
         self._export_weights(q4nx_path, "vision")

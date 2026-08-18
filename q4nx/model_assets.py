@@ -443,6 +443,37 @@ def build_readme_meta(output_dir: Path, flm_version: Optional[str]) -> dict:
     return meta
 
 
+def _build_frontmatter(meta: dict) -> str:
+    """Build YAML frontmatter block for the README."""
+    lines = ["---"]
+    if meta.get("license"):
+        lines.append(f"license: {meta['license']}")
+    lang = meta.get("language")
+    if lang:
+        if isinstance(lang, list):
+            lines.append("language:")
+            for l in lang:
+                lines.append(f"- {l}")
+        else:
+            lines.append(f"language:\n- {lang}")
+    source = meta.get("source")
+    if source:
+        lines.append("base_model:")
+        lines.append(f"- {source}")
+    lines.append("base_model_relation: quantized")
+    lines.append("quantized_by: Atomic-Germ")
+    pipeline = meta.get("pipeline_tag")
+    if pipeline:
+        lines.append(f"pipeline_tag: {pipeline}")
+    tags = meta.get("tags")
+    if tags:
+        lines.append("tags:")
+        for t in tags:
+            lines.append(f"- {t}")
+    lines.append("---")
+    return "\n".join(lines)
+
+
 def _readme_banner(meta: dict) -> str:
     title = meta.get("title") or meta.get("source") or "Model"
     source = meta.get("source")
@@ -450,7 +481,9 @@ def _readme_banner(meta: dict) -> str:
     weight_file = meta.get("weight_file", "model.q4nx")
     modality = meta.get("modality", "language")
 
-    parts = [f"# {title}", ""]
+    frontmatter = _build_frontmatter(meta)
+
+    parts = [frontmatter, f"# {title}", ""]
     if source and meta.get("source_url"):
         parts.append(
             f"**FastFlowLM Q4NX conversion of [`{source}`]({meta['source_url']})** "
@@ -483,47 +516,20 @@ def _readme_banner(meta: dict) -> str:
     if meta.get("date"):
         rows.append(f"| Converted | {meta['date']} |")
     parts.append("\n".join(rows))
-
-    repo_rows = []
-    if meta.get("license"):
-        repo_rows.append(f"| License | {meta['license']} |")
-    if meta.get("base_model"):
-        repo_rows.append(f"| Base model | `{meta['base_model']}` |")
-    if meta.get("library"):
-        repo_rows.append(f"| Library | `{meta['library']}` |")
-    if meta.get("model_type"):
-        repo_rows.append(f"| Model type | `{meta['model_type']}` |")
-    if meta.get("pipeline_tag"):
-        repo_rows.append(f"| Pipeline | `{meta['pipeline_tag']}` |")
-    if meta.get("quant_method"):
-        repo_rows.append(f"| Upstream quant method | `{meta['quant_method']}` |")
-    if meta.get("downloads"):
-        repo_rows.append(f"| Downloads | {meta['downloads']:,} |")
-    if meta.get("sha"):
-        repo_rows.append(f"| Repo revision | `{meta['sha']}` |")
-    if repo_rows:
-        parts += [
-            "",
-            "## Source repository",
-            "",
-            "Metadata from the upstream Hugging Face repository:",
-            "",
-            "| Item | Value |",
-            "|------|-------|",
-            "\n".join(repo_rows),
-            "",
-        ]
     parts += [
         "",
-        "## Usage",
+        "## Install and run",
         "",
-        "Run it with FastFlowLM:",
+        "This repository works with `flm-add`, a small installer that copies the model",
+        "into the FastFlowLM user directory and registers the tag. It never",
+        "modifies the system FastFlowLM install.",
+        "",
+        "`pip install flm-add` or `uv tool install flm-add`",
         "",
         "```bash",
-        f"flm run {tag}",
-        "",
-        "# or serve it as an OpenAI-compatible endpoint:",
-        f"flm serve {tag}",
+        f"uv tool install flm-add",
+        f"flm-add Atomic-Germ/{tag} --family {meta.get('family', 'qwen3.5')} --xclbin-from {meta.get('xclbin_from', tag)}",
+        f"FLM_CONFIG_PATH=\"$HOME/.config/flm/model_list.json\" FLM_XCLBIN_PATH=\"$HOME/.config/flm\" flm run {tag}",
         "```",
         "",
         "## Files",
@@ -534,8 +540,6 @@ def _readme_banner(meta: dict) -> str:
     file_rows = []
     if "language" in modality or modality == "language":
         file_rows.append(("model.q4nx", "Quantized weights (Q8_0 / Q4_1 / BF16)"))
-    if "vision" in modality:
-        file_rows.append(("vision_weight.q4nx", "Vision encoder weights"))
     if "audio" in modality:
         file_rows.append(("audio_weight.q4nx", "Audio encoder weights"))
     file_rows += [
@@ -544,6 +548,8 @@ def _readme_banner(meta: dict) -> str:
         ("tokenizer_config.json", "Tokenizer configuration"),
         ("chat_template.jinja", "Chat template"),
     ]
+    if "vision" in modality:
+        file_rows.append(("vision_weight.q4nx", "Vision model"))
     parts.append("\n".join(f"| `{name}` | {desc} |" for name, desc in file_rows))
     return "\n".join(parts) + "\n\n"
 
@@ -565,8 +571,12 @@ def _adapt_source_readme(text: str) -> str:
 
 def generate_readme(readme_text: Optional[str], meta: dict) -> str:
     parts = [_readme_banner(meta)]
-    if readme_text:
-        parts.append("---\n\n## Source model card\n\n" + _adapt_source_readme(readme_text))
+    source = meta.get("source")
+    source_url = meta.get("source_url")
+    if source and source_url:
+        parts.append(f"---\n\n## Source model card\n\nSee the original model card: [{source}]({source_url})\n")
+    elif source:
+        parts.append(f"---\n\n## Source model card\n\nSee the original model card: `{source}` on Hugging Face\n")
     else:
         parts.append(
             "---\n\n*Original model card not included; see the source repository for details.*\n"
@@ -809,6 +819,9 @@ def inject_flm_keys(config: dict, q4nx_config: dict, output_dir: Path, flm_versi
         # Darwin-style text-only MoE: model_type becomes qwen3_5_moe_text.
         if text_config.get("model_type"):
             config["model_type"] = text_config["model_type"]
+    # Strip keys the FLM runtime doesn't consume (HF VL wrapper leftovers).
+    for key in ("video_token_id",):
+        config.pop(key, None)
     # Drop HF vision blob when no vision weights were converted (text-only finetunes).
     if not (output_dir / "vision_weight.q4nx").exists():
         config.pop("vision_model_weight", None)
@@ -853,11 +866,9 @@ def inject_flm_keys(config: dict, q4nx_config: dict, output_dir: Path, flm_versi
         vision_file = vision_config.get("vision_file", "vision_weight.q4nx")
         if (output_dir / vision_file).exists():
             config["vision_model_weight"] = vision_file
-            vc = config.setdefault("vision_config", {})
-            if "vision_MM_K" in vision_config:
-                vc["vision_MM_K"] = vision_config["vision_MM_K"]
-            if "vision_MM_N" in vision_config:
-                vc["vision_MM_N"] = vision_config["vision_MM_N"]
+            vc = {k: v for k, v in vision_config.items()
+                  if k not in ("vision_file", "vision_MM_K", "vision_MM_N")}
+            config["vision_config"] = vc
         else:
             config.pop("vision_model_weight", None)
     audio_config = q4nx_config.get("audio_config", {})
@@ -904,11 +915,18 @@ def assemble_model_assets_hf(
         output_dir = output_dir.parent
     os.makedirs(output_dir, exist_ok=True)
 
-    candidate = source_model or hf_source
-    fetched = _fetch_assets(candidate, output_dir, ASSET_FILES)
-    missing = [f for f in REQUIRED_ASSETS if f not in fetched]
-    if missing:
-        print(f"[WARN] HF source {candidate} missing required assets: {missing}")
+    # Try the weight source first, then fall back to -s for anything missing.
+    candidates = [hf_source]
+    if source_model and source_model != hf_source:
+        candidates.append(source_model)
+    fetched = []
+    for candidate in candidates:
+        fetched = _fetch_assets(candidate, output_dir, ASSET_FILES)
+        missing = [f for f in REQUIRED_ASSETS if f not in fetched]
+        if not missing:
+            break
+        if fetched:
+            print(f"[WARN] Source {candidate} is missing required assets: {missing}")
 
     config_path = output_dir / "config.json"
     if config_path.exists():
@@ -923,7 +941,7 @@ def assemble_model_assets_hf(
     ensure_hf_tokenizer_ids(output_dir)
 
     assemble_readme(
-        output_dir, [candidate], build_readme_meta(output_dir, flm_version), source_file
+        output_dir, candidates, build_readme_meta(output_dir, flm_version), source_file
     )
 
     print(f"[INFO] Model directory ready: {output_dir}")
