@@ -4,3 +4,6 @@
 [submodule "tools/flm-add"]
 	path = tools/flm-add
 	url = git@github.com:Atomic-Germ/flm-add.git
+[submodule "tools/mlir-aie"]
+	path = tools/mlir-aie
+	url = org-3189299@github.com:Xilinx/mlir-aie.git
