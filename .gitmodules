@@ -1,0 +1,6 @@
+[submodule "tools/flm-test"]
+	path = tools/flm-test
+	url = git@github.com:Atomic-Germ/flm-test.git
+[submodule "tools/flm-add"]
+	path = tools/flm-add
+	url = git@github.com:Atomic-Germ/flm-add.git
