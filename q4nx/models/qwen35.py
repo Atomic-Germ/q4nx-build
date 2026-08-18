@@ -1,7 +1,7 @@
 from pprint import pp
 
 from ..model_converter import __Q4NX_Converter
-from ..constants import ModelArch
+from ..constants import ModelArch, ModelArchNames
 from gguf import GGUFReader, dequantize, quantize, GGMLQuantizationType
 from safetensors.torch import save_file
 from einops import rearrange, repeat
@@ -10,7 +10,8 @@ import json
 
 class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
     def __init__(self, source, config_json_path=None):
-        print("[INFO] Using Qwen35_4B converter")
+        variant = ModelArchNames.get(self.model_arch, str(self.model_arch))
+        print(f"[INFO] Using Qwen35 converter (variant: {variant})")
         self.gguf_reader = None
         self.gguf_tensors = []
         self.hf_source = None
@@ -375,14 +376,11 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
 
 
 class Qwen35_2B(Qwen35, model_arch=ModelArch.QWEN35_2B):
-    print("[INFO] Using Qwen35_2B converter")
     pass
 
 
 class Qwen35_08B(Qwen35, model_arch=ModelArch.QWEN35_08B):
-    print("[INFO] Using Qwen35_08B converter")
     pass
 
 class Qwen35_9B(Qwen35, model_arch=ModelArch.QWEN35_9B):
-    print("[INFO] Using Qwen35_9B converter")
     pass
