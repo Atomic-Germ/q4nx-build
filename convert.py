@@ -66,7 +66,11 @@ def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str
 
     if hf_input is not None:
         model = create_hf_converter(hf_input, override_model_arch)
-        model.convert(q4nx_path=q4nx_path, weights_type=weights_type)
+        if weights_type == "vision":
+            model.convert(q4nx_path=q4nx_path, weights_type="language")
+            model.convert(q4nx_path=q4nx_path, weights_type="vision")
+        else:
+            model.convert(q4nx_path=q4nx_path, weights_type=weights_type)
         assemble_model_assets_hf(
             model.hf_source,
             model.q4nx_config,
@@ -77,7 +81,11 @@ def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str
         )
     else:
         model = create_converter(gguf_path, override_model_arch)
-        model.convert(q4nx_path=q4nx_path, weights_type=weights_type)
+        if weights_type == "vision":
+            model.convert(q4nx_path=q4nx_path, weights_type="language")
+            model.convert(q4nx_path=q4nx_path, weights_type="vision")
+        else:
+            model.convert(q4nx_path=q4nx_path, weights_type=weights_type)
         assemble_model_assets(
             model.gguf_reader,
             model.q4nx_config,
