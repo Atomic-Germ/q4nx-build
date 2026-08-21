@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from .arch_detect import ARCH_TO_FAMILY, family_from_text, resolve_override_arch
 from .constants import ModelArch
 
-ASSET_FILES = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"]
+ASSET_FILES = ["vision_weight.q4nx","config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"]
 REQUIRED_ASSETS = ["config.json", "tokenizer.json", "tokenizer_config.json"]
 
 

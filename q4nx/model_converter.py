@@ -104,7 +104,7 @@ class __Q4NX_Converter(ABC):
 
     def _load_config(self, config_file_path: str = None):
         if config_file_path is None:
-            config_file_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs")
+            config_file_path = resolve_configs_dir()
         config_path = os.path.join(config_file_path, ModelArchConfigs[self.model_arch])
         print(f"[INFO] Loading Q4NX config from {config_path}")
         self.q4nx_config = json.load(open(config_path))
@@ -1191,11 +1191,18 @@ def get_model_arch_from_gguf(reader: GGUFReader, override_model_arch:str="") -> 
 def get_registered_models() -> Dict[ModelArch, Type['__Q4NX_Converter']]:
     """
     Get the dictionary of registered model converters.
-    
+
     Returns:
         Dictionary mapping ModelArch to converter classes
     """
     return _MODEL_REGISTRY.copy()
+
+
+def resolve_configs_dir() -> str:
+    """Return the absolute path of the repository's configs/ directory."""
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs"
+    )
 
 
 def create_converter(gguf_path: str, override_model_arch:str) -> __Q4NX_Converter:
