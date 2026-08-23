@@ -78,6 +78,7 @@ def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str
             source_model=source_model or hf_input,
             flm_version=flm_version,
             source_file=source_file,
+            model_arch=model.model_arch,
         )
     else:
         model = create_converter(gguf_path, override_model_arch)
@@ -93,6 +94,7 @@ def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str
             source_model=source_model,
             flm_version=flm_version,
             source_file=source_file,
+            model_arch=model.model_arch,
         )
     if deploy_tag:
         from q4nx.deploy import deploy_model
