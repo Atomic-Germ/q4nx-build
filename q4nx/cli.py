@@ -22,6 +22,16 @@ def _is_hf_repo_id(path: str) -> bool:
     return len(parts) == 2 and all(parts) and "\\" not in path
 
 
+def _is_hf_source(path: str) -> bool:
+    """True if path is a local HF-safetensors model dir."""
+    if os.path.isdir(path):
+        return (
+            os.path.exists(os.path.join(path, "model.safetensors"))
+            or os.path.exists(os.path.join(path, "model.safetensors.index.json"))
+        )
+    return False
+
+
 def _parse_args(argv):
     import argparse
 
@@ -81,43 +91,68 @@ def main(argv=None) -> int:
 
     output_folder = args.output_flag or os.path.dirname(input_path) or "."
 
+    # Local paths must exist; HF repo ids are resolved later by the converter.
     if not _is_hf_repo_id(input_path) and not os.path.exists(input_path):
         sys.exit(f"Error: Input file does not exist: {input_path}")
 
-    input_path = os.path.abspath(input_path)
-    output_folder = os.path.abspath(output_folder)
-    os.makedirs(os.path.dirname(output_folder) or ".", exist_ok=True)
-
     flm_version = args.flm_version or get_default_flm_version()
 
-    # HF repo id path: auto-select a quantized GGUF from the repo if available.
+    # Resolve the weight source before touching absolute paths: an HF repo id
+    # must stay in 'org/name' form or _is_hf_repo_id/create_hf_converter won't
+    # recognize it.
+    #
+    # -i <hf-repo-id> prefers a quantized GGUF shipped in the repo itself,
+    # chosen in a family-preferred order (default q4_1, then q4_0, then q8_0).
+    # The order is driven by -f when given. The chosen GGUF is downloaded via
+    # the HF cache; if the repo has none, we fall back to the HF-safetensors
+    # source path below.
+    hf_input = None
+    source_file = None
+    source_model = args.source_model
     if _is_hf_repo_id(input_path):
         found = find_repo_gguf(input_path, args.force_model_type)
         if found is not None:
             input_path, source_file = found
-            args.source_model = args.source_model or input_path
+            source_model = source_model or input_path
+        else:
+            hf_input = input_path
+    elif _is_hf_source(input_path):
+        hf_input = input_path
+
+    output_folder = os.path.abspath(output_folder)
+    os.makedirs(os.path.dirname(output_folder) or ".", exist_ok=True)
 
     print(f"[INFO] Converting {input_path} to {output_folder}...")
 
-    if _is_hf_repo_id(input_path) or os.path.isdir(input_path):
-        model = create_hf_converter(input_path, args.force_model_type)
-        model.convert(q4nx_path=output_folder, weights_type=args.weights_type)
+    if hf_input is not None:
+        model = create_hf_converter(hf_input, args.force_model_type)
+        if args.weights_type == "vision":
+            model.convert(q4nx_path=output_folder, weights_type="language")
+            model.convert(q4nx_path=output_folder, weights_type="vision")
+        else:
+            model.convert(q4nx_path=output_folder, weights_type=args.weights_type)
         assemble_model_assets_hf(
             model.hf_source,
             model.q4nx_config,
             output_folder,
-            source_model=args.source_model or input_path,
+            source_model=source_model or hf_input,
             flm_version=flm_version,
+            source_file=source_file,
         )
     else:
         model = create_converter(input_path, args.force_model_type)
-        model.convert(q4nx_path=output_folder, weights_type=args.weights_type)
+        if args.weights_type == "vision":
+            model.convert(q4nx_path=output_folder, weights_type="language")
+            model.convert(q4nx_path=output_folder, weights_type="vision")
+        else:
+            model.convert(q4nx_path=output_folder, weights_type=args.weights_type)
         assemble_model_assets(
             model.gguf_reader,
             model.q4nx_config,
             output_folder,
-            source_model=args.source_model,
+            source_model=source_model,
             flm_version=flm_version,
+            source_file=source_file,
         )
 
     if args.deploy_tag:
