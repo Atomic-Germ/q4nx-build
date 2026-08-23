@@ -2,3 +2,4 @@ build
 dist
 venv
 q4nx_build.egg-info
+__pycache__
