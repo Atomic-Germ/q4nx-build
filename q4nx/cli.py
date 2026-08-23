@@ -138,6 +138,7 @@ def main(argv=None) -> int:
             source_model=source_model or hf_input,
             flm_version=flm_version,
             source_file=source_file,
+            model_arch=model.model_arch,
         )
     else:
         model = create_converter(input_path, args.force_model_type)
@@ -153,6 +154,7 @@ def main(argv=None) -> int:
             source_model=source_model,
             flm_version=flm_version,
             source_file=source_file,
+            model_arch=model.model_arch,
         )
 
     if args.deploy_tag:

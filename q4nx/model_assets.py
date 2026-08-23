@@ -13,6 +13,51 @@ from .constants import ModelArch
 ASSET_FILES = ["vision_weight.q4nx","audio_weight.q4nx","config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"]
 REQUIRED_ASSETS = ["config.json", "tokenizer.json", "tokenizer_config.json"]
 
+# Dense qwen3.5 variants always ship as vision-capable models: the upstream
+# FLM NPU repos carry a vision_weight.q4nx and the runtime expects a unified
+# model_type, whether or not the finetune itself had vision weights.
+# Qwen3.5/3.6-MoE NPUs are likewise always vision-capable.
+QWEN35_VISION_ARCHS = frozenset({
+    ModelArch.QWEN35_08B,
+    ModelArch.QWEN35_2B,
+    ModelArch.QWEN35_4B,
+    ModelArch.QWEN35_9B,
+    ModelArch.QWEN35MOE,
+})
+
+# The runtime's vision-capable model_type per architecture family.
+QWEN35_VISION_MODEL_TYPES = {
+    ModelArch.QWEN35_08B: "qwen3_5",
+    ModelArch.QWEN35_2B: "qwen3_5",
+    ModelArch.QWEN35_4B: "qwen3_5",
+    ModelArch.QWEN35_9B: "qwen3_5",
+    ModelArch.QWEN35MOE: "qwen3_5_moe",
+}
+
+
+def _ensure_qwen35_vision_weight(
+    q4nx_config: dict, output_dir: Path, candidates: List[Optional[str]]
+) -> bool:
+    """Pull vision_weight.q4nx from the source repos when the build lacks one.
+
+    Tries candidates in order (the -s upstream source first), accepting local
+    dirs and HF repo ids. Returns True when a vision weight file is present in
+    output_dir afterwards.
+    """
+    vision_file = q4nx_config.get("vision_config", {}).get("vision_file", "vision_weight.q4nx")
+    if (output_dir / vision_file).exists():
+        return True
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if vision_file in _fetch_assets(candidate, output_dir, [vision_file]):
+            print(f"[INFO] Fetched {vision_file} from {candidate}")
+            return True
+    print(f"[WARN] Could not fetch {vision_file} from any source; shipping text-only")
+    return False
+
 
 def _gguf_field(reader, name: str):
     """Return the python value of a GGUF metadata field (scalar string/array included)."""
@@ -868,6 +913,17 @@ def inject_flm_keys(config: dict, q4nx_config: dict, output_dir: Path, flm_versi
             config["vision_model_weight"] = vision_file
             vc = {k: v for k, v in vision_config.items()
                   if k not in ("vision_file", "vision_MM_K", "vision_MM_N")}
+            # The projector emits into the LM hidden size; size variants share
+            # one arch config, so always take this from the assembled model.
+            out_key = next((k for k in vc if k.endswith("_VISION_OUT_HIDDEN_SIZE")), None)
+            if out_key is None:
+                patch_key = next((k for k in vc if k.endswith("_PATCH_SIZE")), None)
+                if patch_key:
+                    out_key = patch_key[: -len("_PATCH_SIZE")] + "_VISION_OUT_HIDDEN_SIZE"
+            if out_key is not None and config.get("hidden_size"):
+                vc[out_key] = config["hidden_size"]
+            elif out_key is not None:
+                print(f"[WARN] No hidden_size in source config; {out_key} left unset")
             config["vision_config"] = vc
         else:
             config.pop("vision_model_weight", None)
@@ -902,6 +958,7 @@ def assemble_model_assets_hf(
     source_model: Optional[str] = None,
     flm_version: Optional[str] = None,
     source_file: Optional[str] = None,
+    model_arch: Optional[ModelArch] = None,
 ) -> None:
     """Build a complete model directory from an HF safetensors source.
 
@@ -934,7 +991,12 @@ def assemble_model_assets_hf(
             config = json.load(f)
     else:
         config = {}
+    if model_arch in QWEN35_VISION_ARCHS:
+        _ensure_qwen35_vision_weight(q4nx_config, output_dir, [source_model, *candidates])
     inject_flm_keys(config, q4nx_config, output_dir, flm_version)
+    vision_model_type = QWEN35_VISION_MODEL_TYPES.get(model_arch)
+    if vision_model_type:
+        config["model_type"] = vision_model_type
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
@@ -954,6 +1016,7 @@ def assemble_model_assets(
     source_model: Optional[str] = None,
     flm_version: Optional[str] = None,
     source_file: Optional[str] = None,
+    model_arch: Optional[ModelArch] = None,
 ) -> None:
     """Build a complete, uploadable model directory.
 
@@ -994,7 +1057,12 @@ def assemble_model_assets(
         print("[WARN] tokenizer files may not exactly match the official model.")
         config = generate_config_from_gguf(reader)
 
+    if model_arch in QWEN35_VISION_ARCHS:
+        _ensure_qwen35_vision_weight(q4nx_config, output_dir, [source_model, *candidates])
     inject_flm_keys(config, q4nx_config, output_dir, flm_version)
+    vision_model_type = QWEN35_VISION_MODEL_TYPES.get(model_arch)
+    if vision_model_type:
+        config["model_type"] = vision_model_type
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
