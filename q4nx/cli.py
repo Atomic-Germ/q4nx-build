@@ -3,6 +3,14 @@
 import os
 import sys
 
+from q4nx import create_converter, create_hf_converter
+from q4nx.model_assets import (
+    assemble_model_assets,
+    assemble_model_assets_hf,
+    get_default_flm_version,
+    find_repo_gguf,
+)
+
 
 def _is_hf_repo_id(path: str) -> bool:
     """True if path looks like an 'org/name' HF repo id (not a local path, not a .gguf)."""
