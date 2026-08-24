@@ -4,11 +4,14 @@ import os
 import sys
 
 from q4nx import create_converter, create_hf_converter
+from q4nx.arch_detect import family_from_text
+from q4nx.build_plan import derive_build_plan, format_chain
 from q4nx.model_assets import (
     assemble_model_assets,
     assemble_model_assets_hf,
     get_default_flm_version,
     find_repo_gguf,
+    select_repo_gguf,
 )
 
 
@@ -55,14 +58,31 @@ def _parse_args(argv):
         "-t",
         "--type",
         dest="weights_type",
-        default="language",
+        default=None,
         choices=["language", "vision", "audio"],
+        help="Type of weights to convert (default: inferred from the repo card; "
+             "VLM pipeline tags convert language + vision, otherwise language)",
     )
     parser.add_argument(
         "-f", "--force", dest="force_model_type", default="", help="Model type override"
     )
     parser.add_argument(
-        "-s", "--source-model", dest="source_model", default=None, help="Source HF/ModelScope model"
+        "-s", "--source-model", dest="source_model", default=None,
+        help="Source HF/ModelScope model for tokenizer/config assets (the NPU2 "
+             "skeleton). Default: the first ancestor in the repo card's "
+             "base_model chain with an {org}/{base}-NPU2 mirror "
+             "(orgs: Atomic-Germ, then FastFlowLM).",
+    )
+    parser.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="Resolve and print the build plan (GGUF choice, base_model chain, "
+             "skeleton source, output name, weights type) without converting.",
+    )
+    parser.add_argument(
+        "--pad-to-fit", dest="pad_to_fit", action="store_true",
+        help="When the model's hidden size is smaller than the selected engine "
+             "variant's official dim, zero-pad the hidden axis so the weights "
+             "fit the compiled variant (padded channels are inert).",
     )
     parser.add_argument(
         "--flm-version", dest="flm_version", default=None, help="flm_version to write into config.json"
@@ -89,13 +109,42 @@ def main(argv=None) -> int:
     if not input_path:
         sys.exit("Error: Input file is required. Use -i <file> or provide as positional argument.")
 
-    output_folder = args.output_flag or os.path.dirname(input_path) or "."
-
     # Local paths must exist; HF repo ids are resolved later by the converter.
     if not _is_hf_repo_id(input_path) and not os.path.exists(input_path):
         sys.exit(f"Error: Input file does not exist: {input_path}")
 
     flm_version = args.flm_version or get_default_flm_version()
+
+    # Fill unspecified -s/-o/-t from the repo card's base_model chain
+    # (q4nx.build_plan): walk ancestors until one has an {org}/{base}-NPU2
+    # mirror, use it as the skeleton source, and read the output name and VLM
+    # detection from the same cards. Explicit flags always win.
+    weights_type = args.weights_type
+    source_model = args.source_model
+    output_folder = args.output_flag
+    family_hint = None
+    plan = None
+    if _is_hf_repo_id(input_path):
+        plan = derive_build_plan(input_path)
+        print(f"[INFO] Base chain: {format_chain(plan.chain)}")
+        if source_model is None:
+            if plan.skeleton:
+                print(f"[INFO] Skeleton source: {plan.skeleton}")
+            else:
+                print("[WARN] No {org}/{base}-NPU2 skeleton found on the chain; "
+                      "pass -s to name the asset source explicitly.")
+            source_model = plan.skeleton
+        if weights_type is None:
+            weights_type = plan.weights_type
+            suffix = f" ({plan.weights_reason})" if plan.weights_reason else ""
+            print(f"[INFO] Weights type: {weights_type}{suffix}")
+        if output_folder is None and plan.output_name:
+            output_folder = plan.output_name
+            print(f"[INFO] Output folder: {output_folder} (from card metadata)")
+        family_hint = family_from_text(" ".join(plan.chain))
+
+    weights_type = weights_type or "language"
+    output_folder = output_folder or os.path.dirname(input_path) or "."
 
     # Resolve the weight source before touching absolute paths: an HF repo id
     # must stay in 'org/name' form or _is_hf_repo_id/create_hf_converter won't
@@ -103,21 +152,41 @@ def main(argv=None) -> int:
     #
     # -i <hf-repo-id> prefers a quantized GGUF shipped in the repo itself,
     # chosen in a family-preferred order (default q4_1, then q4_0, then q8_0).
-    # The order is driven by -f when given. The chosen GGUF is downloaded via
-    # the HF cache; if the repo has none, we fall back to the HF-safetensors
-    # source path below.
+    # The order is driven by -f when given, then by the chain-derived family
+    # hint. The chosen GGUF is downloaded via the HF cache; if the repo has
+    # none, we fall back to the HF-safetensors source path below.
     hf_input = None
     source_file = None
-    source_model = args.source_model
+    selected_gguf = None
     if _is_hf_repo_id(input_path):
-        found = find_repo_gguf(input_path, args.force_model_type)
-        if found is not None:
-            input_path, source_file = found
-            source_model = source_model or input_path
+        if args.dry_run:
+            selected_gguf = select_repo_gguf(input_path, args.force_model_type, family_hint)
+            if selected_gguf is None:
+                hf_input = input_path
         else:
-            hf_input = input_path
+            found = find_repo_gguf(input_path, args.force_model_type, family_hint=family_hint)
+            if found is not None:
+                input_path, source_file = found
+                source_model = source_model or input_path
+            else:
+                hf_input = input_path
     elif _is_hf_source(input_path):
         hf_input = input_path
+
+    if args.dry_run:
+        requested = args.input_flag or args.input_file
+        print("[DRY-RUN] Build plan (nothing was converted or downloaded):")
+        print(f"  input:         {requested}")
+        if selected_gguf:
+            print(f"  source GGUF:   {selected_gguf}")
+        elif hf_input:
+            print("  source:        HF safetensors (no quantized GGUF in the repo)")
+        elif os.path.exists(requested):
+            print(f"  source GGUF:   {requested}")
+        print(f"  skeleton (-s): {source_model or '(GGUF provenance fallback)'}")
+        print(f"  weights (-t):  {weights_type}")
+        print(f"  output (-o):   {os.path.abspath(output_folder)}")
+        return 0
 
     output_folder = os.path.abspath(output_folder)
     os.makedirs(os.path.dirname(output_folder) or ".", exist_ok=True)
@@ -126,11 +195,12 @@ def main(argv=None) -> int:
 
     if hf_input is not None:
         model = create_hf_converter(hf_input, args.force_model_type)
-        if args.weights_type == "vision":
+        model.pad_to_fit = args.pad_to_fit
+        if weights_type == "vision":
             model.convert(q4nx_path=output_folder, weights_type="language")
             model.convert(q4nx_path=output_folder, weights_type="vision")
         else:
-            model.convert(q4nx_path=output_folder, weights_type=args.weights_type)
+            model.convert(q4nx_path=output_folder, weights_type=weights_type)
         assemble_model_assets_hf(
             model.hf_source,
             model.q4nx_config,
@@ -142,11 +212,12 @@ def main(argv=None) -> int:
         )
     else:
         model = create_converter(input_path, args.force_model_type)
-        if args.weights_type == "vision":
+        model.pad_to_fit = args.pad_to_fit
+        if weights_type == "vision":
             model.convert(q4nx_path=output_folder, weights_type="language")
             model.convert(q4nx_path=output_folder, weights_type="vision")
         else:
-            model.convert(q4nx_path=output_folder, weights_type=args.weights_type)
+            model.convert(q4nx_path=output_folder, weights_type=weights_type)
         assemble_model_assets(
             model.gguf_reader,
             model.q4nx_config,

@@ -50,6 +50,29 @@ python convert.py -h
 python convert.py [input_file] [output_folder] [-t TYPE]
 ```
 
+### One-flag builds from an HF repo (installed `q4nx-build`)
+
+When `-i` names an HF repo, `q4nx-build` fills in the rest from the repo's own model card:
+
+```bash
+q4nx-build -i numind/NuExtract3-GGUF
+```
+
+1. **Base chain** — it follows the `base_model` frontmatter up the tree
+   (`numind/NuExtract3-GGUF -> numind/NuExtract3 -> Qwen/Qwen3.5-4B -> ...`) and stops at the first
+   ancestor with a `{org}/{base}-NPU2` mirror. Orgs are tried in order: **Atomic-Germ**, then **FastFlowLM**.
+   That mirror becomes the `-s` skeleton source for tokenizer/config/vision assets.
+2. **Weights type** — VLM pipeline tags (`image-text-to-text`, ...) or vision tags imply `-t vision`
+   (language + vision weights); otherwise language.
+3. **Output name** — `{model_name or repo name}-{size}-NPU2`, e.g. `NuExtract3-4B-NPU2`. The size token
+   is parsed from the skeleton's name and skipped when the display name already carries it.
+
+Explicit flags always win over derived values. Preview everything without converting:
+
+```bash
+q4nx-build -i numind/NuExtract3-GGUF --dry-run
+```
+
 ### Arguments
 - **`input_file`**  
   Also available as **`-i`** or **`--input`**.  
@@ -72,6 +95,15 @@ python convert.py [input_file] [output_folder] [-t TYPE]
   Forces the converter to use a specific model architecture instead of detecting it automatically from the GGUF metadata.  
   This can be useful when automatic detection is incorrect or when you want to explicitly select an architecture such as **`qwen2`**, **`llama`**, or **`gemma3`**.  
   Leave this option out if you want the converter to detect the architecture automatically.
+
+- **`-s`, `--source-model`**  
+  Source HF/ModelScope model for tokenizer/config assets (the NPU2 skeleton).  
+  When omitted and `-i` is an HF repo, the base_model chain is walked automatically (see
+  [One-flag builds](#one-flag-builds-from-an-hf-repo-installed-q4nx-build)).
+
+- **`--dry-run`**  
+  Print the resolved build plan (GGUF choice, base_model chain, skeleton source, output name,
+  weights type) without converting or downloading anything.
 
 ### Examples
 

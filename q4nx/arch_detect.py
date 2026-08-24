@@ -454,6 +454,55 @@ def resolve_override_arch(override: str) -> Optional[ModelArch]:
     return best_match
 
 
+def _normalized_override(override: str) -> str:
+    return override.replace(":", "-").lower()
+
+
+def override_resolves_exactly(override: str) -> bool:
+    """True when -f names one concrete arch, not just a family prefix.
+
+    resolve_override_arch matches by prefix, so '-f qwen3.5' collapses into the
+    plain-qwen3 entry ('qwen3' is a prefix of 'qwen3.5'). That is only
+    acceptable when the matched name consumes the whole override, stopping
+    exactly or at a '-' boundary ('qwen3', 'qwen3.5-2b', 'gemma4-e2b');
+    otherwise the string pins a family and the size variant must be resolved
+    from GGUF metadata instead.
+    """
+    best = resolve_override_arch(override)
+    if best is None:
+        return False
+    normalized = _normalized_override(override)
+    for arch_name in ModelArchNames.get(best, []):
+        name = arch_name.lower()
+        if normalized.startswith(name):
+            remainder = normalized[len(name):]
+            if remainder == "" or remainder.startswith("-"):
+                return True
+    return False
+
+
+def resolve_override_candidates(override: str) -> Optional[set]:
+    """Set of ModelArchs whose names EXTEND the given -f string, or None.
+
+    '-f qwen3.5' pins {QWEN35_08B, QWEN35_2B, QWEN35_4B, QWEN35_9B, QWEN35MOE}
+    without choosing a size; the caller then resolves the concrete variant from
+    GGUF metadata restricted to this set. Returns None when the override names
+    one arch exactly (or matches nothing, letting metadata decide freely).
+    """
+    if not override or override_resolves_exactly(override):
+        return None
+    normalized = _normalized_override(override)
+    dotless = normalized.replace(".", "")
+    candidates: list = []
+    for arch_enum, arch_names in ModelArchNames.items():
+        for arch_name in arch_names:
+            lowered = arch_name.lower()
+            if lowered.startswith(normalized) or lowered.startswith(dotless):
+                candidates.append(arch_enum)
+                break
+    return set(candidates) if candidates else None
+
+
 def family_from_text(text: str) -> Optional[str]:
     """Best-effort family name from an arbitrary string (repo id, file name).
 
