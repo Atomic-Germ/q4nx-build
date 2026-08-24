@@ -941,8 +941,17 @@ def inject_flm_keys(config: dict, q4nx_config: dict, output_dir: Path, flm_versi
         vision_file = vision_config.get("vision_file", "vision_weight.q4nx")
         if (output_dir / vision_file).exists():
             config["vision_model_weight"] = vision_file
-            vc = {k: v for k, v in vision_config.items()
-                  if k not in ("vision_file", "vision_MM_K", "vision_MM_N")}
+            # Prefer a vision_config that arrived with the source assets (an
+            # NPU2 skeleton's config.json): it describes exactly the vision
+            # blob being shipped, whereas the arch config's numbers can lag
+            # per-size tower changes (embed dim / depth differ across 0.8B-9B).
+            skeleton_vc = config.get("vision_config")
+            if isinstance(skeleton_vc, dict) and "vision_mm_engine_xclbin_name" in skeleton_vc:
+                vc = dict(skeleton_vc)
+                print("[INFO] Keeping skeleton-provided vision_config (matches shipped vision weights)")
+            else:
+                vc = {k: v for k, v in vision_config.items()
+                      if k not in ("vision_file", "vision_MM_K", "vision_MM_N")}
             # The projector emits into the LM hidden size; size variants share
             # one arch config, so always take this from the assembled model.
             out_key = next((k for k in vc if k.endswith("_VISION_OUT_HIDDEN_SIZE")), None)

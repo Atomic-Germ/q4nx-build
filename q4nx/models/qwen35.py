@@ -317,6 +317,14 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                 self.q4nx_tensors[self.forward_name_map[gguf_tensor.name]] = self._pack(*unpacked, tensor_type=target_dtype)
             self._extract_tokenizer_json(q4nx_path)                
         elif weights_type == "vision":
+            # Some GGUF quantizers ship vision weights as a separate mmproj
+            # file, leaving the language GGUF without any v.* tensors. Skip
+            # cleanly: assemble_model_assets then sources vision_weight.q4nx
+            # from the skeleton repo instead (see _ensure_qwen35_vision_weight).
+            if not any(name.startswith("v.") for name in self.gguf_tensors):
+                print("[WARN] No vision tensors in this GGUF; skipping vision conversion "
+                      "(vision weights will be sourced from the skeleton if available)")
+                return
             for key, gguf_tensor in self.gguf_tensors.items():
                 unpacked = gguf_tensor.unpack(GGMLQuantizationType.BF16)
                 assert len(unpacked) == 1
@@ -324,23 +332,24 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                 weights = unpacked[0]
                 if weights.dtype != torch.bfloat16:
                     weights = weights.to(torch.bfloat16)
-                    
-                new_name = self.forward_name_map[gguf_tensor.name]                        
-                
+
+                new_name = self.forward_name_map[gguf_tensor.name]
+
                 if new_name.endswith("fc2.weight") or new_name.endswith("fc1.weight")\
                     or new_name.endswith("attn.proj.weight") or new_name.endswith("attn.qkv.weight"):
                     weights = self.vision_mm_weight_rearrange(weights)
-                
+
                 self.q4nx_tensors[new_name] = weights
-                
-            combined_patched_embeding= torch.stack(
-                [self.q4nx_tensors["model.visual.patch_embed.proj.weight"],
-                         self.q4nx_tensors["model.visual.patch_embed.proj.weight.1"]
-                 ], dim=2
-            )
-            del self.q4nx_tensors["model.visual.patch_embed.proj.weight"]
-            del self.q4nx_tensors["model.visual.patch_embed.proj.weight.1"]
-            self.q4nx_tensors["model.visual.patch_embed.proj.weight"] = combined_patched_embeding
+
+            pe = "model.visual.patch_embed.proj.weight"
+            pe1 = pe + ".1"
+            if pe in self.q4nx_tensors and pe1 in self.q4nx_tensors:
+                combined_patched_embeding = torch.stack(
+                    [self.q4nx_tensors[pe], self.q4nx_tensors[pe1]], dim=2
+                )
+                del self.q4nx_tensors[pe]
+                del self.q4nx_tensors[pe1]
+                self.q4nx_tensors[pe] = combined_patched_embeding
     
         else:
             raise ValueError(f"Unsupported weights_type: {weights_type} for Qwen35 model")
