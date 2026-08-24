@@ -244,19 +244,27 @@ GGUF_QUANT_PRIORITY_BY_FAMILY: Dict[str, Tuple[str, ...]] = {
 }
 
 
-def _gguf_quant_priority(override_model_arch: str, repo_id: str, gguf_filenames: List[str]) -> Tuple[str, ...]:
+def _gguf_quant_priority(
+    override_model_arch: str,
+    repo_id: str,
+    gguf_filenames: List[str],
+    family_hint: Optional[str] = None,
+) -> Tuple[str, ...]:
     """Resolve the GGUF quant fallback order for an HF repo.
 
     Precedence:
       1. -f flag (resolve override_model_arch -> family)
-      2. best-effort keyword match against the repo id or any .gguf filename
-      3. the global GGUF_QUANT_PRIORITY default
+      2. family hint from the base_model chain (see build_plan.derive_build_plan)
+      3. best-effort keyword match against the repo id or any .gguf filename
+      4. the global GGUF_QUANT_PRIORITY default
     """
     family: Optional[str] = None
     if override_model_arch:
         arch = resolve_override_arch(override_model_arch)
         if arch is not None:
             family = ARCH_TO_FAMILY.get(arch)
+    if family is None:
+        family = family_hint
     if family is None:
         family = family_from_text(repo_id)
     if family is None:
@@ -269,16 +277,16 @@ def _gguf_quant_priority(override_model_arch: str, repo_id: str, gguf_filenames:
     return GGUF_QUANT_PRIORITY
 
 
-def find_repo_gguf(repo_id: str, override_model_arch: str = "") -> Optional[Tuple[str, str]]:
-    """Search an HF repo for a quantized GGUF, in family-preferred order.
+def select_repo_gguf(
+    repo_id: str,
+    override_model_arch: str = "",
+    family_hint: Optional[str] = None,
+) -> Optional[str]:
+    """Pick the best quantized GGUF filename in an HF repo, without downloading.
 
-    The quant fallback order is family-aware: most families prefer q4_1 then
-    q4_0 then q8_0, but some differ (e.g. LFM prefers q4_0 first; gpt-oss also
-    accepts mxfp4 last). It is driven by the -f flag when given, otherwise by a
-    best-effort match on the repo id / GGUF filenames.
-
-    Returns (local_path, repo_filename) using the HF cache (downloading if
-    needed), or None if the repo has no matching GGUF.
+    Same family-aware preference order as find_repo_gguf. Returns the chosen
+    repo-relative filename, or None if the repo has no matching GGUF. Split
+    from find_repo_gguf so --dry-run can preview the choice cheaply.
     """
     try:
         from huggingface_hub import list_repo_files
@@ -294,7 +302,7 @@ def find_repo_gguf(repo_id: str, override_model_arch: str = "") -> Optional[Tupl
     gguf_filenames = [
         f for f in files if f.lower().endswith(".gguf")
     ]
-    priority = _gguf_quant_priority(override_model_arch, repo_id, gguf_filenames)
+    priority = _gguf_quant_priority(override_model_arch, repo_id, gguf_filenames, family_hint)
 
     matches = []  # (priority_index, filename)
     other_ggufs = []
@@ -317,6 +325,28 @@ def find_repo_gguf(repo_id: str, override_model_arch: str = "") -> Optional[Tupl
 
     _, filename = sorted(matches, key=lambda m: (m[0], m[1].lower()))[0]
     print(f"[INFO] Found GGUF in {repo_id}: {filename}")
+    return filename
+
+
+def find_repo_gguf(
+    repo_id: str,
+    override_model_arch: str = "",
+    family_hint: Optional[str] = None,
+) -> Optional[Tuple[str, str]]:
+    """Search an HF repo for a quantized GGUF, in family-preferred order.
+
+    The quant fallback order is family-aware: most families prefer q4_1 then
+    q4_0 then q8_0, but some differ (e.g. LFM prefers q4_0 first; gpt-oss also
+    accepts mxfp4 last). It is driven by the -f flag when given, by the
+    optional family_hint (resolved from the base_model chain), otherwise by a
+    best-effort match on the repo id / GGUF filenames.
+
+    Returns (local_path, repo_filename) using the HF cache (downloading if
+    needed), or None if the repo has no matching GGUF.
+    """
+    filename = select_repo_gguf(repo_id, override_model_arch, family_hint)
+    if filename is None:
+        return None
     path = _hf_download_file(repo_id, filename)
     if path is None:
         return None

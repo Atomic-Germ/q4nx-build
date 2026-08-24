@@ -1,15 +1,73 @@
 from pprint import pp
 
 from ..model_converter import __Q4NX_Converter
-from ..constants import ModelArch, ModelArchNames
+from ..constants import ModelArch, ModelArchNames, QWEN35_VARIANT_DIMS
 from ..gguf_tensor import GGUFTensor
 from gguf import GGUFReader, dequantize, quantize, GGMLQuantizationType
 from safetensors.torch import save_file
 from einops import rearrange, repeat
+import numpy as np
 import torch
 import json
 
+# Tensors whose last dimension is the hidden size (hidden as INPUT):
+# zero-padding appends inert columns. --pad-to-fit uses these so a finetune
+# with an off-nominal width fits an engine variant compiled for the nearest
+# official dim (downstream matmuls have zero columns there).
+PAD_HIDDEN_INPUT_SUFFIXES = (
+    "token_embd.weight",
+    "output.weight",
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_qkv.weight",
+    "attn_gate.weight",
+    "ffn_up.weight",
+    "ffn_gate.weight",
+)
+
+# Tensors whose FIRST dimension is the hidden size (hidden as OUTPUT):
+# attention/mlp output projections feed a fixed-width engine residual stream.
+PAD_HIDDEN_OUTPUT_SUFFIXES = (
+    "attn_output.weight",
+    "ssm_out.weight",
+    "ffn_down.weight",
+)
+
+# 1-D RMS norm weights sized to hidden.
+PAD_HIDDEN_NORM_SUFFIXES = (
+    "attn_norm.weight",
+    "post_attention_norm.weight",
+)
+
+
+def pad_hidden_axis(w: torch.Tensor, actual: int, target: int) -> torch.Tensor:
+    """Zero-pad the hidden axis of a weight from actual to target.
+
+    2-D tensors: pad columns (hidden-as-input convention). Use transpose via
+    pad_hidden_axis_t for output projections whose rows are hidden. 1-D norms:
+    pad length. Returns w unchanged when no axis matches or target <= actual.
+    """
+    if target <= actual:
+        return w
+    if w.dim() == 2 and w.shape[1] == actual:
+        return torch.cat([w, w.new_zeros((w.shape[0], target - actual))], dim=1)
+    if w.dim() == 1 and w.shape[0] == actual:
+        return torch.cat([w, w.new_zeros(target - actual)])
+    return w
+
+
+def pad_hidden_axis_t(w: torch.Tensor, actual: int, target: int) -> torch.Tensor:
+    """Zero-pad ROWS (hidden-as-output convention) from actual to target."""
+    if target <= actual:
+        return w
+    if w.dim() == 2 and w.shape[0] == actual:
+        return torch.cat([w, w.new_zeros((target - actual, w.shape[1]))])
+    return w
+
 class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
+    pad_to_fit = False  # --pad-to-fit: zero-pad the hidden axis to the variant dim
+
     def __init__(self, source, config_json_path=None):
         variant = ModelArchNames.get(self.model_arch, str(self.model_arch))
         print(f"[INFO] Using Qwen35 converter (variant: {variant})")
@@ -43,19 +101,86 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
         else:
             self._convert_hf(q4nx_path, weights_type)
 
+    def _resolve_pad_target(self):
+        """--pad-to-fit setup: hidden actual vs the variant's official dim.
+
+        Only upward padding is supported: the engine variant expects a fixed
+        width, and zero columns are inert in every downstream matmul. A width
+        larger than any variant cannot be shrunk.
+        """
+        self._pad_hidden = None
+        self._pad_actual = None
+        if not getattr(self, "pad_to_fit", False):
+            return
+        if self.gguf_reader is None:
+            print("[WARN] --pad-to-fit currently applies to GGUF sources only")
+            return
+        field = self.gguf_reader.fields.get("qwen35.embedding_length")
+        if field is None:
+            print("[WARN] --pad-to-fit: GGUF has no qwen35.embedding_length; padding disabled")
+            return
+        actual = int(field.contents())
+        target = QWEN35_VARIANT_DIMS.get(self.model_arch)
+        if target is None:
+            return
+        if target < actual:
+            print(f"[WARN] --pad-to-fit cannot shrink hidden {actual} -> {target} "
+                  f"({self.model_arch.name}); padding disabled")
+            return
+        if target == actual:
+            print(f"[INFO] --pad-to-fit: hidden {actual} already matches "
+                  f"{self.model_arch.name}; nothing to pad")
+            return
+        self._pad_actual = actual
+        self._pad_hidden = target
+        print(f"[INFO] --pad-to-fit: zero-padding hidden axis {actual} -> {target} "
+              f"({self.model_arch.name})")
+
+    def _maybe_pad(self, gguf_tensor, unpacked, target_dtype):
+        """Re-quantize a hidden-axis tensor after zero-padding it to fit."""
+        if self._pad_hidden is None:
+            return unpacked
+        name = gguf_tensor.name
+        if name.endswith(PAD_HIDDEN_OUTPUT_SUFFIXES):
+            pad_fn = pad_hidden_axis_t  # hidden is the output (row) axis
+        elif name.endswith(PAD_HIDDEN_INPUT_SUFFIXES) or name.endswith(PAD_HIDDEN_NORM_SUFFIXES):
+            pad_fn = pad_hidden_axis  # hidden is the input (column) axis / 1-D norm
+        else:
+            return unpacked
+        w = torch.from_numpy(gguf_tensor.dequantize())
+        padded = pad_fn(w, self._pad_actual, self._pad_hidden)
+        if padded is w:
+            return unpacked
+        np_w = np.ascontiguousarray(padded.to(torch.float32).numpy())
+        if target_dtype == GGMLQuantizationType.Q4_1:
+            q = quantize(np_w, target_dtype)
+            d, m, qw = GGUFTensor.unpack_q4_1(q, np_w.shape[1])
+            return (d, m, qw)
+        if target_dtype == GGMLQuantizationType.Q8_0:
+            q = quantize(np_w, target_dtype)
+            d, m, qw = GGUFTensor.unpack_q8_0(q, np_w.shape[1])
+            return (d, m, qw)
+        if len(unpacked) == 1:
+            # Unquantized (F32/BF16) single-block tensors: store the padded array.
+            return (np_w.astype(unpacked[0].dtype),)
+        print(f"[WARN] --pad-to-fit: unsupported dtype {target_dtype.name} for {name}; left unpadded")
+        return unpacked
+
     def _convert_gguf(self, q4nx_path: str, weights_type: str):
         if weights_type == "language":
+            self._resolve_pad_target()
             reorder_linear_required = True
             if self.gguf_reader.fields["qwen35.feed_forward_length"].contents() <= 6144:
                 reorder_linear_required = False
             if reorder_linear_required:
                 print("[INFO] Reorder linear required!")
 
-            full_attntion_interval = self.gguf_reader.fields["qwen35.full_attention_interval"].contents()            
             if not self._has_lm_head():
                 print("[INFO] Model does not have a lm_head, use embedding weights as lm_head")
-                unpacked = self.gguf_tensors["token_embd.weight"].unpack(GGMLQuantizationType.Q8_0)
-                target_dtype = self.gguf_tensors["token_embd.weight"].get_used_quantization_type(GGMLQuantizationType.Q8_0)
+                emb = self.gguf_tensors["token_embd.weight"]
+                unpacked = emb.unpack(GGMLQuantizationType.Q8_0)
+                target_dtype = emb.get_used_quantization_type(GGMLQuantizationType.Q8_0)
+                unpacked = self._maybe_pad(emb, unpacked, GGMLQuantizationType.Q8_0)
                 self.q4nx_tensors["lm_head.weight"] = self._pack(*unpacked, tensor_type=target_dtype)
 
             for key, gguf_tensor in self.gguf_tensors.items():
@@ -66,26 +191,32 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                 print(f"Processing tensor: {gguf_tensor.name} with type {gguf_tensor.tensor_type.name} -> {self.forward_name_map[gguf_tensor.name]} with dtype {target_dtype.name}")
                 if "token_embd.weight" in gguf_tensor.name:
                     w = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
-                    w = torch.from_numpy(w).contiguous().to(torch.bfloat16)
+                    w = torch.from_numpy(w).contiguous()
+                    if self._pad_hidden is not None:
+                        w = pad_hidden_axis(w, self._pad_actual, self._pad_hidden)
+                        print(f"[INFO] Padded token_embd.weight hidden axis to {self._pad_hidden}")
+                    w = w.to(torch.bfloat16)
                     self.q4nx_tensors[self.forward_name_map[gguf_tensor.name]] = w
                     continue
                 
                 new_name = self.forward_name_map[gguf_tensor.name]
-                layer_id = 0
-                if "layers." in new_name:
-                    layer_id = int(new_name.split("layers.")[1].split(".")[0])
 
                 unpacked = gguf_tensor.unpack(target_dtype)
+                unpacked = self._maybe_pad(gguf_tensor, unpacked, target_dtype)
 
-                if layer_id % full_attntion_interval == (full_attntion_interval - 1):    
-                    if "q_proj" in self.forward_name_map[gguf_tensor.name]:
-                        print("[INFO] Seperate q, gate for q_proj")
-                        DH = self.gguf_reader.fields["qwen35.attention.value_length"].contents()
-                        d, m, qw = unpacked
-                        d = rearrange(d, '(g p h) c -> (p g h) c', p = 2, h = DH).contiguous()
-                        m = rearrange(m, '(g p h) c -> (p g h) c', p = 2, h = DH).contiguous()
-                        qw = rearrange(qw, '(g p h) c -> (p g h) c', p = 2, h = DH).contiguous()
-                        unpacked = (d, m, qw)
+                # Only full-attention layers produce a self_attn.q_proj target
+                # (linear layers fuse q/k/v into attn_qkv). Branch on the
+                # target name rather than layer_id % interval: the trailing
+                # MTP block is full attention but sits at an index the modulo
+                # test misclassifies (e.g. 24 with interval 4).
+                if "self_attn.q_proj" in new_name:
+                    print("[INFO] Seperate q, gate for q_proj")
+                    DH = self.gguf_reader.fields["qwen35.attention.value_length"].contents()
+                    d, m, qw = unpacked
+                    d = rearrange(d, '(g p h) c -> (p g h) c', p = 2, h = DH).contiguous()
+                    m = rearrange(m, '(g p h) c -> (p g h) c', p = 2, h = DH).contiguous()
+                    qw = rearrange(qw, '(g p h) c -> (p g h) c', p = 2, h = DH).contiguous()
+                    unpacked = (d, m, qw)
 
                 else:
                     if "self_attn.gate_proj" in self.forward_name_map[gguf_tensor.name]:

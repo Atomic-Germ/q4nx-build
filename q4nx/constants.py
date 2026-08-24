@@ -25,13 +25,29 @@ class ModelArch(IntEnum):
 
 # Qwen3.5 variant detection: llama.cpp GGUFs expose general.architecture ==
 # 'qwen35' with no size suffix, so the variant is inferred from the embedding
-# dimension (qwen35.embedding_length).
+# dimension (qwen35.embedding_length). Values verified against upstream
+# Qwen/Qwen3.5-{0.8B,2B,4B,9B} config.json hidden_size (2026-08).
 QWEN35_VARIANT_DIMS: dict[ModelArch, int] = {
-    ModelArch.QWEN35_08B: 1536,
-    ModelArch.QWEN35_2B: 2304,
+    ModelArch.QWEN35_08B: 1024,
+    ModelArch.QWEN35_2B: 2048,
     ModelArch.QWEN35_4B: 2560,
     ModelArch.QWEN35_9B: 4096,
 }
+
+
+def nearest_qwen35_variant(embedding_length: int) -> tuple[ModelArch, int]:
+    """Variant with the closest embedding dim; returns (arch, absolute delta).
+
+    Community quantizations of Qwen3.5-family finetunes sometimes ship widths
+    that match no official variant (e.g. distilled models at hidden 2048).
+    Rather than falling through to name heuristics that misread them as plain
+    qwen3, pick the structurally closest variant and let the caller warn.
+    """
+    arch = min(
+        QWEN35_VARIANT_DIMS,
+        key=lambda variant: abs(QWEN35_VARIANT_DIMS[variant] - embedding_length),
+    )
+    return arch, abs(QWEN35_VARIANT_DIMS[arch] - embedding_length)
 
 ModelArchNames: dict[ModelArch, list[str]] = {
     ModelArch.QWEN35_08B: ["qwen35-0.8B","qwen3.5-0.8B"],

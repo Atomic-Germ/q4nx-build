@@ -4,7 +4,13 @@ from gguf import GGUFReader
 from .constants import ModelArch, ModelArchNames
 from .constants import ModelArchConfigs
 from .constants import QWEN35_VARIANT_DIMS
-from .arch_detect import detect_model_family, resolve_override_arch
+from .arch_detect import (
+    detect_model_family,
+    override_resolves_exactly,
+    resolve_override_arch,
+    resolve_override_candidates,
+)
+from .constants import nearest_qwen35_variant
 from .gguf_tensor import GGUFTensor, GGMLQuantizationType
 from typing import List, Dict, Type
 import os
@@ -1121,13 +1127,25 @@ def get_model_arch_from_gguf(reader: GGUFReader, override_model_arch:str="") -> 
         ValueError: If the architecture is not recognized or supported
     """
     
+    family_pin = None  # set of ModelArchs an ambiguous -f string restricts us to
     if override_model_arch != "":
         best_match = resolve_override_arch(override_model_arch)
-        if best_match is not None:
+        if best_match is not None and override_resolves_exactly(override_model_arch):
             return best_match
-        print("Warning: Did not find matching override model arch, attempting to load base on gguf information")
+        # Not a concrete arch ('-f qwen3.5' must not collapse into plain qwen3
+        # just because 'qwen3' is a string prefix): pin the variant family and
+        # let the GGUF metadata below pick the exact size.
+        family_pin = resolve_override_candidates(override_model_arch)
+        if family_pin:
+            print(f"[INFO] -f '{override_model_arch}' pins the variant family "
+                  f"({', '.join(sorted(a.name for a in family_pin))}); "
+                  "resolving the size from GGUF metadata.")
+        else:
+            print("Warning: Did not find matching override model arch, attempting to load base on gguf information")
 
-    
+    def _pinned(arch: ModelArch) -> bool:
+        return family_pin is None or arch in family_pin
+
     # Get architecture from GGUF metadata
     # The architecture is typically stored in the 'general.architecture' field
     arch_str:str|None = None
@@ -1137,38 +1155,54 @@ def get_model_arch_from_gguf(reader: GGUFReader, override_model_arch:str="") -> 
             arch_str = str(field.parts[field.data[0]], encoding='utf-8') if field.data else None
         elif field.name == 'general.basename':
             basename_str = str(field.parts[field.data[0]], encoding='utf-8') if field.data else None
-    
+
 
     # Map the architecture string to ModelArch enum
     if arch_str is not None:
         for arch_enum, arch_names in ModelArchNames.items():
             for arch_name in arch_names:
-                if arch_str.lower() == arch_name.lower():
+                if arch_str.lower() == arch_name.lower() and _pinned(arch_enum):
                     return arch_enum
 
     # llama.cpp reports the Qwen3.5 architecture without a size suffix
     # (general.architecture == 'qwen35'), so infer the variant from the
-    # embedding dimension.
+    # embedding dimension. Finetunes sometimes ship widths matching no official
+    # variant; fall back to the closest one instead of dropping into the
+    # name-based fallbacks that misread them as plain qwen3.
     if arch_str is not None and arch_str.lower() in ("qwen35", "qwen3.5"):
         field = reader.fields.get("qwen35.embedding_length")
         if field is not None:
             dim = field.contents()
-            for variant, expected_dim in QWEN35_VARIANT_DIMS.items():
-                if dim == expected_dim:
-                    return variant
+            exact = next(
+                (v for v, d in QWEN35_VARIANT_DIMS.items() if d == dim and _pinned(v)),
+                None,
+            )
+            if exact is not None:
+                return exact
+            near, delta = nearest_qwen35_variant(dim)
+            if _pinned(near):
+                known = ", ".join(str(d) for d in QWEN35_VARIANT_DIMS.values())
+                print(
+                    f"[WARN] qwen35.embedding_length={dim} matches no known Qwen3.5 "
+                    f"variant (known dims: {known}); using {near.name}, the closest "
+                    f"(off by {delta}). Pass -f qwen3.5-<size> to force another, or "
+                    "--pad-to-fit to zero-pad the hidden axis up to the variant dim."
+                )
+                return near
 
     if basename_str is not None:
         for arch_enum, arch_names in ModelArchNames.items():
             for arch_name in arch_names:
-                if basename_str.lower().startswith(arch_name.lower()):
+                if basename_str.lower().startswith(arch_name.lower()) and _pinned(arch_enum):
                     return arch_enum
 
 
     # --- heuristic fallback: "close enough" guess the user can refine ---
-    guesses = detect_model_family(reader)
+    guesses = [
+        g for g in detect_model_family(reader)
+        if g.arch in _MODEL_REGISTRY and _pinned(g.arch)
+    ]
     for guess in guesses:
-        if guess.arch not in _MODEL_REGISTRY:
-            continue
         print("[WARN] general.architecture was missing or unrecognized; using a heuristic guess.")
         print(f"[WARN] Best guess: {guess.arch.name} ({guess.confidence} confidence).")
         for reason in guess.reasons:
@@ -1246,9 +1280,21 @@ def create_hf_converter(
     3. Default: QWEN35MOE (legacy fallback)
     """
     if override_model_arch:
-        model_arch = resolve_override_arch(override_model_arch)
-        if model_arch is None:
-            raise ValueError(f"Unknown architecture override: {override_model_arch}")
+        if override_resolves_exactly(override_model_arch):
+            model_arch = resolve_override_arch(override_model_arch)
+        else:
+            # Family-style pin ('-f qwen3.5'): resolve the variant from the
+            # HF config instead of letting the prefix match land on plain qwen3.
+            family_pin = resolve_override_candidates(override_model_arch)
+            detected = _detect_hf_arch(hf_source)
+            if detected is not None and family_pin and detected in family_pin:
+                model_arch = detected
+                print(f"[INFO] -f '{override_model_arch}' pins the variant family; "
+                      f"HF config resolved it to {model_arch.name}.")
+            elif detected is not None:
+                model_arch = detected
+            else:
+                raise ValueError(f"Unknown architecture override: {override_model_arch}")
     else:
         model_arch = _detect_hf_arch(hf_source)
 
