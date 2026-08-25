@@ -5,7 +5,12 @@ import sys
 
 from q4nx import create_converter, create_hf_converter
 from q4nx.arch_detect import family_from_text
-from q4nx.build_plan import derive_build_plan, format_chain
+from q4nx.build_plan import (
+    derive_build_plan,
+    derive_build_plan_from_card,
+    find_skeleton_for_arch,
+    format_chain,
+)
 from q4nx.model_assets import (
     assemble_model_assets,
     assemble_model_assets_hf,
@@ -35,6 +40,26 @@ def _is_hf_source(path: str) -> bool:
     return False
 
 
+def _is_card_source(path: str) -> bool:
+    """True for a model-card-only input: a README.md file or a dir holding one.
+
+    Dirs that carry actual weights/configs are real local sources, not cards.
+    """
+    if os.path.isfile(path):
+        return path.lower().endswith((".md", ".markdown"))
+    if os.path.isdir(path):
+        if os.path.basename(path).lower() == "readme.md":
+            return True
+        has_card = os.path.isfile(os.path.join(path, "README.md"))
+        has_weights = (
+            os.path.exists(os.path.join(path, "model.safetensors"))
+            or os.path.exists(os.path.join(path, "model.safetensors.index.json"))
+            or any(f.lower().endswith(".gguf") for f in os.listdir(path))
+        )
+        return has_card and not has_weights
+    return False
+
+
 def _parse_args(argv):
     import argparse
 
@@ -49,7 +74,9 @@ def _parse_args(argv):
     )
     parser.add_argument("input_file", nargs="?", help="Input GGUF file (positional)")
     parser.add_argument(
-        "-i", "--input", dest="input_flag", help="Input GGUF file, or an HF repo id"
+        "-i", "--input", dest="input_flag",
+        help="Input GGUF file, an HF repo id, or a model card (dir with "
+             "README.md / a .md file) naming one",
     )
     parser.add_argument(
         "-o", "--output", dest="output_flag", help="Output folder (optional)"
@@ -124,8 +151,36 @@ def main(argv=None) -> int:
     output_folder = args.output_flag
     family_hint = None
     plan = None
+    if _is_card_source(input_path):
+        print(f"[INFO] Reading model card: {input_path}")
+        try:
+            plan = derive_build_plan_from_card(input_path)
+        except FileNotFoundError as e:
+            sys.exit(f"Error: {e}")
+        if not plan.repo_id:
+            sys.exit("Error: Could not determine an HF repo id from this model card "
+                     "(no org/name mention found in the body or frontmatter).")
+        print(f"[INFO] Card names upstream repo: {plan.repo_id}")
+        input_path = plan.repo_id
     if _is_hf_repo_id(input_path):
-        plan = derive_build_plan(input_path)
+        if plan is None:
+            plan = derive_build_plan(input_path)
+        # Chain dead-end rescue: a repo may declare no base_model anywhere,
+        # yet its config.json still reveals family+size, which maps to the
+        # same {org}/{base}-NPU2 mirror convention (GRaPE-style cards).
+        if plan.skeleton is None:
+            try:
+                from q4nx.model_converter import _detect_hf_arch
+
+                arch = _detect_hf_arch(input_path)
+            except Exception:
+                arch = None
+            if arch is not None:
+                rescued = find_skeleton_for_arch(arch)
+                if rescued:
+                    plan.skeleton = rescued
+                    print(f"[INFO] No base_model declared; config.json says "
+                          f"{arch.name}, so using skeleton: {rescued}")
         print(f"[INFO] Base chain: {format_chain(plan.chain)}")
         if source_model is None:
             if plan.skeleton:

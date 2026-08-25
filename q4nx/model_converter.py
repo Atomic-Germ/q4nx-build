@@ -1349,7 +1349,12 @@ def _detect_hf_arch(hf_source: str) -> ModelArch | None:
     if arch_str in ("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_6_moe", "qwen3_6_moe_text"):
         return ModelArch.QWEN35MOE
     if arch_str in ("qwen3_5", "qwen35"):
-        hidden_size = cfg.get("hidden_size", 0)
+        # VL wrappers nest the LM dims under text_config (GRaPE-style cards).
+        hidden_size = (
+            cfg.get("hidden_size")
+            or (cfg.get("text_config") or {}).get("hidden_size")
+            or 0
+        )
         for variant, expected_dim in QWEN35_VARIANT_DIMS.items():
             if hidden_size == expected_dim:
                 return variant
@@ -1484,7 +1489,11 @@ def _detect_arch_from_readme_base_model(hf_source: str) -> ModelArch | None:
     if arch_str in ("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_6_moe", "qwen3_6_moe_text"):
         return ModelArch.QWEN35MOE
     if arch_str in ("qwen3_5", "qwen35"):
-        hidden_size = cfg.get("hidden_size", 0)
+        hidden_size = (
+            cfg.get("hidden_size")
+            or (cfg.get("text_config") or {}).get("hidden_size")
+            or 0
+        )
         for variant, expected_dim in QWEN35_VARIANT_DIMS.items():
             if hidden_size == expected_dim:
                 return variant
