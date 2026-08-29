@@ -76,7 +76,7 @@ ModelArchConfigs: dict[ModelArch, str] = {
     ModelArch.QWEN35_4B: "qwen3.5_4b.json",
     ModelArch.QWEN35_9B: "qwen3.5_9b.json",
     ModelArch.QWEN35_2B: "qwen3.5_2b.json",
-    ModelArch.QWEN35_08B: "qwen3.5_0.8b.json",
+    ModelArch.QWEN35_08B: "qwen3.5_0.8b.q4_1.json",
     ModelArch.QWEN35MOE: "qwen35moe.json",
     ModelArch.GEMMA3:  "gemma3.json",
     ModelArch.GEMMA4:  "gemma4.json",
@@ -86,3 +86,22 @@ ModelArchConfigs: dict[ModelArch, str] = {
     ModelArch.GPT_OSS: "gpt-oss.json",
     ModelArch.NANBEIGE: "nanbeige.json"
 }
+
+# Models that carry a dedicated Q4_K Q4NX config (byte-matching the official
+# FLM converter's Q4_K output), selected by --quant q4_k. Anything not listed
+# keeps the ModelArchConfigs default.
+Q4_K_CONFIGS: dict[ModelArch, str] = {
+    ModelArch.QWEN35_08B: "qwen3.5_0.8b.q4_k.json",
+}
+
+
+def config_filename_for_arch(model_arch: ModelArch, quant: str | None = None) -> str:
+    """Resolve the Q4NX config filename for an arch, honoring --quant.
+
+    quant None / 'q4_1' / empty use the ModelArchConfigs default; the special
+    quant 'q4_k' selects a dedicated Q4_K config when the model carries one,
+    falling back to the default otherwise.
+    """
+    if quant and str(quant).lower() == "q4_k" and model_arch in Q4_K_CONFIGS:
+        return Q4_K_CONFIGS[model_arch]
+    return ModelArchConfigs[model_arch]

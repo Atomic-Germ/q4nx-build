@@ -249,6 +249,7 @@ def _gguf_quant_priority(
     repo_id: str,
     gguf_filenames: List[str],
     family_hint: Optional[str] = None,
+    prefer_quant: Optional[str] = None,
 ) -> Tuple[str, ...]:
     """Resolve the GGUF quant fallback order for an HF repo.
 
@@ -257,6 +258,9 @@ def _gguf_quant_priority(
       2. family hint from the base_model chain (see build_plan.derive_build_plan)
       3. best-effort keyword match against the repo id or any .gguf filename
       4. the global GGUF_QUANT_PRIORITY default
+
+    prefer_quant (the --quant CLI flag) is hoisted to the front of whatever
+    order the above rules produce, so `--quant q4_k` prefers a *Q4_K.gguf.
     """
     family: Optional[str] = None
     if override_model_arch:
@@ -273,14 +277,19 @@ def _gguf_quant_priority(
             if family is not None:
                 break
     if family and family in GGUF_QUANT_PRIORITY_BY_FAMILY:
-        return GGUF_QUANT_PRIORITY_BY_FAMILY[family]
-    return GGUF_QUANT_PRIORITY
+        priority: Tuple[str, ...] = GGUF_QUANT_PRIORITY_BY_FAMILY[family]
+    else:
+        priority = GGUF_QUANT_PRIORITY
+    if prefer_quant:
+        priority = (prefer_quant,) + tuple(q for q in priority if q != prefer_quant)
+    return priority
 
 
 def select_repo_gguf(
     repo_id: str,
     override_model_arch: str = "",
     family_hint: Optional[str] = None,
+    prefer_quant: Optional[str] = None,
 ) -> Optional[str]:
     """Pick the best quantized GGUF filename in an HF repo, without downloading.
 
@@ -302,7 +311,7 @@ def select_repo_gguf(
     gguf_filenames = [
         f for f in files if f.lower().endswith(".gguf")
     ]
-    priority = _gguf_quant_priority(override_model_arch, repo_id, gguf_filenames, family_hint)
+    priority = _gguf_quant_priority(override_model_arch, repo_id, gguf_filenames, family_hint, prefer_quant)
 
     matches = []  # (priority_index, filename)
     other_ggufs = []
@@ -332,6 +341,7 @@ def find_repo_gguf(
     repo_id: str,
     override_model_arch: str = "",
     family_hint: Optional[str] = None,
+    prefer_quant: Optional[str] = None,
 ) -> Optional[Tuple[str, str]]:
     """Search an HF repo for a quantized GGUF, in family-preferred order.
 
@@ -339,12 +349,13 @@ def find_repo_gguf(
     q4_0 then q8_0, but some differ (e.g. LFM prefers q4_0 first; gpt-oss also
     accepts mxfp4 last). It is driven by the -f flag when given, by the
     optional family_hint (resolved from the base_model chain), otherwise by a
-    best-effort match on the repo id / GGUF filenames.
+    best-effort match on the repo id / GGUF filenames, with the --quant flag
+    (prefer_quant) hoisted to the front of the order.
 
     Returns (local_path, repo_filename) using the HF cache (downloading if
     needed), or None if the repo has no matching GGUF.
     """
-    filename = select_repo_gguf(repo_id, override_model_arch, family_hint)
+    filename = select_repo_gguf(repo_id, override_model_arch, family_hint, prefer_quant)
     if filename is None:
         return None
     path = _hf_download_file(repo_id, filename)

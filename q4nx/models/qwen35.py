@@ -175,6 +175,17 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
             if reorder_linear_required:
                 print("[INFO] Reorder linear required!")
 
+            # Every full_attention_interval-th layer (layer_id % interval ==
+            # interval-1) is a real full-attention block whose q_proj stores
+            # rows group-major and must be de-interleaved; all others are
+            # linear/SSM blocks (q/k/v fused into qkv_proj). The trailing MTP
+            # block (e.g. blk.24 with interval 4) is dropped in full by the
+            # base converter (_read_gguf_tensors) and never reaches this loop.
+            full_attention_interval = self.gguf_reader.fields.get("qwen35.full_attention_interval")
+            if full_attention_interval is not None:
+                full_attention_interval = full_attention_interval.contents()
+            tied_embedding = not self._has_lm_head()
+
             if not self._has_lm_head():
                 print("[INFO] Model does not have a lm_head, use embedding weights as lm_head")
                 emb = self.gguf_tensors["token_embd.weight"]
@@ -187,9 +198,21 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                 if ".nextn." in gguf_tensor.name:
                     print(f"[SKIP] {gguf_tensor.name} (MTP next-token prediction weights, absent from official Q4NX)")
                     continue
+                if gguf_tensor.name not in self.forward_name_map:
+                    # Some GGUFs ship an extra unquantized bf16 copy of alpha/
+                    # beta (blk.{bid}.ssm_{alpha,beta}.bf16.weight) or other
+                    # auxiliary tensors without a name mapping. Drop them; the
+                    # official converter does not export them.
+                    print(f"[WARN] No name mapping for {gguf_tensor.name}, skipping")
+                    continue
                 target_dtype = gguf_tensor.get_used_quantization_type(self.tensor_q4nx_type_map[gguf_tensor.name])
                 print(f"Processing tensor: {gguf_tensor.name} with type {gguf_tensor.tensor_type.name} -> {self.forward_name_map[gguf_tensor.name]} with dtype {target_dtype.name}")
                 if "token_embd.weight" in gguf_tensor.name:
+                    if tied_embedding:
+                        # lm_head.weight above already carries these weights;
+                        # the official output has no model.embed_tokens copy.
+                        print("[INFO] Tied embedding, skipping bf16 copy of token_embd.weight")
+                        continue
                     w = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
                     w = torch.from_numpy(w).contiguous()
                     if self._pad_hidden is not None:
@@ -200,16 +223,19 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                     continue
                 
                 new_name = self.forward_name_map[gguf_tensor.name]
+                layer_id = 0
+                if "layers." in new_name:
+                    layer_id = int(new_name.split("layers.")[1].split(".")[0])
 
                 unpacked = gguf_tensor.unpack(target_dtype)
                 unpacked = self._maybe_pad(gguf_tensor, unpacked, target_dtype)
 
-                # Only full-attention layers produce a self_attn.q_proj target
-                # (linear layers fuse q/k/v into attn_qkv). Branch on the
-                # target name rather than layer_id % interval: the trailing
-                # MTP block is full attention but sits at an index the modulo
-                # test misclassifies (e.g. 24 with interval 4).
-                if "self_attn.q_proj" in new_name:
+                is_q_proj = "self_attn.q_proj" in new_name
+                is_full_attn = (
+                    full_attention_interval is not None
+                    and layer_id % full_attention_interval == (full_attention_interval - 1)
+                )
+                if is_q_proj and (is_full_attn or full_attention_interval is None):
                     print("[INFO] Seperate q, gate for q_proj")
                     DH = self.gguf_reader.fields["qwen35.attention.value_length"].contents()
                     d, m, qw = unpacked
@@ -262,15 +288,9 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
 
                             unpacked = (d, m, qw)
 
-                    if "ssm_alpha_proj" in self.forward_name_map[gguf_tensor.name] or "ssm_beta_proj" in self.forward_name_map[gguf_tensor.name]:
+                    if ("ssm_alpha_proj" in self.forward_name_map[gguf_tensor.name] or "ssm_beta_proj" in self.forward_name_map[gguf_tensor.name]) \
+                            and "bf16" not in self.forward_name_map[gguf_tensor.name]:
                         d, m, qw = unpacked
-                        w = gguf_tensor.dequantize()
-                        if reorder_linear_required:
-                            w = rearrange(w, '(q g) c -> (g q) c', q = 2).contiguous()
-
-                        new_name = self.forward_name_map[gguf_tensor.name]
-                        new_name = new_name.replace("alpha_proj", "alpha_proj.bf16").replace("beta_proj", "beta_proj.bf16")
-                        self.q4nx_tensors[new_name] = w
                         if reorder_linear_required:
                             print(f"[INFO] Reorder for {self.forward_name_map[gguf_tensor.name]}")
                             d = rearrange(d, '(q g) c -> (g q) c', q = 2).contiguous()
@@ -281,6 +301,35 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                             d = repeat(d, 'd c -> (r d) c', r = 2).contiguous()
                             m = repeat(m, 'd c -> (r d) c', r = 2).contiguous()
                             qw = repeat(qw, 'd c -> (r d) c', r = 2).contiguous()
+
+                        # Always emit the BF16 prefill copy of alpha/beta,
+                        # matching the official Q4NX structure (every linear
+                        # layer carries both a quantized proj and a raw BF16
+                        # copy used by the chunked-prefill path). Values come
+                        # from the GGUF source via dequantize+reorder; a raw
+                        # HF safetensor supplement (--hf-tensors / -s) refines
+                        # them when the exact prefill weight is available there.
+                        w_bf16 = None
+                        if getattr(self, "hf_supplement_dir", None):
+                            suffix = "in_proj_a.weight" if "ssm_alpha_proj" in self.forward_name_map[gguf_tensor.name] else "in_proj_b.weight"
+                            for candidate in (
+                                f"model.language_model.layers.{layer_id}.linear_attn.{suffix}",
+                                f"model.layers.{layer_id}.linear_attn.{suffix}",
+                            ):
+                                w_bf16 = self._load_supplement_tensor(candidate)
+                                if w_bf16 is not None:
+                                    print(f"[INFO] Refining {candidate} from HF supplement")
+                                    break
+                        if w_bf16 is None:
+                            w_bf16 = gguf_tensor.dequantize()
+                        if reorder_linear_required:
+                            w_bf16 = rearrange(w_bf16, '(q g) c -> (g q) c', q = 2).contiguous()
+                        if w_bf16.dtype != torch.bfloat16:
+                            w_bf16 = w_bf16.to(torch.bfloat16)
+                        bf16_name = self.forward_name_map[gguf_tensor.name] \
+                            .replace("alpha_proj", "alpha_proj.bf16") \
+                            .replace("beta_proj", "beta_proj.bf16")
+                        self.q4nx_tensors[bf16_name] = w_bf16
 
                         unpacked = (d, m, qw)
 

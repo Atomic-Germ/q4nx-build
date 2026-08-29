@@ -94,11 +94,25 @@ def _parse_args(argv):
         "-f", "--force", dest="force_model_type", default="", help="Model type override"
     )
     parser.add_argument(
+        "--quant", dest="quant", default=None, choices=["q4_1", "q4_k"],
+        help="Target Q4NX quantization: q4_1 (default, plain Q4NX) or q4_k "
+             "(byte-matching the official FLM converter's Q4_K output). Also "
+             "steers HF-repo GGUF selection toward a matching GGUF.",
+    )
+    parser.add_argument(
         "-s", "--source-model", dest="source_model", default=None,
         help="Source HF/ModelScope model for tokenizer/config assets (the NPU2 "
              "skeleton). Default: the first ancestor in the repo card's "
              "base_model chain with an {org}/{base}-NPU2 mirror "
-             "(orgs: Atomic-Germ, then FastFlowLM).",
+             "(orgs: Atomic-Germ, then FastFlowLM). If it points at a local dir "
+             "holding raw safetensors, it is also used as the -HF supplement.",
+    )
+    parser.add_argument(
+        "--hf-tensors", dest="hf_tensors", default=None,
+        help="Optional raw HF safetensor source (local dir or repo id) that "
+             "refines the GGUF-derived bf16 prefill copies (alpha/beta) that "
+             "are always emitted. Falls back to -s when -s is a local "
+             "safetensors dir.",
     )
     parser.add_argument(
         "--dry-run", dest="dry_run", action="store_true",
@@ -215,11 +229,11 @@ def main(argv=None) -> int:
     selected_gguf = None
     if _is_hf_repo_id(input_path):
         if args.dry_run:
-            selected_gguf = select_repo_gguf(input_path, args.force_model_type, family_hint)
+            selected_gguf = select_repo_gguf(input_path, args.force_model_type, family_hint, args.quant)
             if selected_gguf is None:
                 hf_input = input_path
         else:
-            found = find_repo_gguf(input_path, args.force_model_type, family_hint=family_hint)
+            found = find_repo_gguf(input_path, args.force_model_type, family_hint=family_hint, prefer_quant=args.quant)
             if found is not None:
                 input_path, source_file = found
                 source_model = source_model or input_path
@@ -240,6 +254,7 @@ def main(argv=None) -> int:
             print(f"  source GGUF:   {requested}")
         print(f"  skeleton (-s): {source_model or '(GGUF provenance fallback)'}")
         print(f"  weights (-t):  {weights_type}")
+        print(f"  quant:         {args.quant or 'q4_1 (default)'}")
         print(f"  output (-o):   {os.path.abspath(output_folder)}")
         return 0
 
@@ -249,7 +264,7 @@ def main(argv=None) -> int:
     print(f"[INFO] Converting {input_path} to {output_folder}...")
 
     if hf_input is not None:
-        model = create_hf_converter(hf_input, args.force_model_type)
+        model = create_hf_converter(hf_input, args.force_model_type, quant=args.quant)
         model.pad_to_fit = args.pad_to_fit
         if weights_type == "vision":
             model.convert(q4nx_path=output_folder, weights_type="language")
@@ -266,7 +281,14 @@ def main(argv=None) -> int:
             model_arch=model.model_arch,
         )
     else:
-        model = create_converter(input_path, args.force_model_type)
+        # Optional raw-HF supplement: --hf-tensors explicitly, else piggyback
+        # -s/--source-model when it points at a local safetensors dir.
+        hf_supplement = args.hf_tensors
+        if not hf_supplement and source_model and _is_hf_source(source_model):
+            hf_supplement = source_model
+            print(f"[INFO] Using raw-HF supplement from -s: {source_model}")
+        model = create_converter(input_path, args.force_model_type, quant=args.quant,
+                                 hf_tensors=hf_supplement)
         model.pad_to_fit = args.pad_to_fit
         if weights_type == "vision":
             model.convert(q4nx_path=output_folder, weights_type="language")

@@ -10,6 +10,85 @@ from mpmath.libmp import int_types
 import numpy as np
 import torch
 
+def _to_bf16_up(x: np.ndarray) -> np.ndarray:
+    """Round the magnitude of a non-negative float32 UP to a BF16 value."""
+    u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32)
+    r = np.where(u & np.uint32(0xFFFF), np.uint32(0x10000), np.uint32(0))
+    return ((u + r) & np.uint32(0xFFFF0000)).view(np.float32)
+
+
+def _bf16_next_up(x: np.ndarray, n: int) -> np.ndarray:
+    """The n-th BF16 value above a BF16-representable, non-negative x (n=0 is x)."""
+    if n == 0:
+        return np.asarray(x, dtype=np.float32)
+    u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32)
+    return (u + np.uint32(n) * np.uint32(0x10000)).view(np.float32)
+
+
+def _refit_one_side(t: np.ndarray, search: int = 3,
+                    cap: float = 255.0) -> Tuple[np.ndarray, np.ndarray]:
+    """Fit one metadata side of a super-block: exact per-group t_j -> (BF16 P', uint8 p'_j).
+
+    Direct port of the pseudocode in quant.md, "Re-fitting (uint6, FP16) into
+    (uint8, BF16)".  The kernel only ever uses the product t_j = P * p_j, so the
+    caller hands over exactly that -- Q4_K's (FP16 P, uint6 p_j) collapsed into a
+    single exact float32 -- and this preserves it directly.
+
+    The two extra bits of p'_j are spent *absorbing* P's rounding error rather
+    than as a plain x4 (which would be a no-op, since P/4 has P's significand):
+    P' is fixed first, rounded away from zero so p'_j can never overflow the cap,
+    then each p'_j is re-derived against the rounded P'.  Since t_j / P' runs up
+    to 255, the quotient can absorb up to 255 * 2^-8 ~ 1 integer step, which the
+    uint8 grid -- 4x finer than the uint6 grid it came from -- can represent.
+
+    `search` also tries that many BF16 values above the base P' and keeps
+    whichever minimizes sum_j (P' p'_j - t_j)^2.  A slightly larger P' often
+    aligns better with several t_j at once than the smallest admissible one, and
+    it is what removes the re-fit's sensitivity to how spread the t_j are; 3 is
+    the knee of the measured sweep.
+
+    Parameters
+    ----------
+    t : np.ndarray
+        Effective per-group scale (or min), shape (..., groups_per_super_block),
+        exact in float32.
+    search : int
+        Number of extra BF16 candidates above the base P' to score.
+    cap : float
+        Largest representable p'_j (255 for uint8).
+
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray]
+        P' (BF16-representable float32, shape t.shape[:-1]) and p'_j (float32
+        integers in [0, cap], shape of t).  Effective value: P' p'_j ~ t_j.
+    """
+    t = np.ascontiguousarray(t, dtype=np.float32)
+    tmax = np.abs(t).max(axis=-1)
+    # p'_j is unsigned, so the sign rides on P'; take it from the largest entry
+    # (Q4_K's d/dmin are non-negative, so every t_j in a group shares one sign).
+    lead = np.take_along_axis(t, np.argmax(np.abs(t), axis=-1)[..., None], axis=-1)[..., 0]
+    sigma = np.where(lead < 0, np.float32(-1.0), np.float32(1.0))
+    t = sigma[..., None] * t
+    live = tmax > 0                                              # dead super-block -> all zero
+    base = _to_bf16_up(tmax / np.float32(cap))
+
+    best_P = np.zeros_like(base)
+    best_p = np.zeros_like(t)
+    best_e = np.full(base.shape, np.inf, dtype=np.float64)
+    for c in range(search + 1):
+        Pc = np.where(live, _bf16_next_up(base, c), np.float32(0.0)).astype(np.float32)
+        inv = np.where(live, 1.0 / np.where(live, Pc, np.float32(1.0)), np.float32(0.0)).astype(np.float32)
+        pc = np.clip(np.rint(t * inv[..., None]), 0.0, cap).astype(np.float32)
+        err = np.sum((Pc[..., None] * pc - t).astype(np.float64) ** 2, axis=-1)
+        take = err < best_e
+        best_e = np.where(take, err, best_e)
+        best_P = np.where(take, Pc, best_P)
+        best_p = np.where(take[..., None], pc, best_p)
+
+    return (sigma * best_P).astype(np.float32), best_p
+
+
 class GGUFTensor:
     name: str
     shape: Tuple[int, ...]
@@ -21,6 +100,9 @@ class GGUFTensor:
         self.shape = shape
         self.data = data
         self.tensor_type = tensor_type
+
+    Q4_K_GROUP_SIZE = 32
+    Q4_K_SUPER_BLOCK_SIZE = 256
 
     @staticmethod
     def unpack_q4_0(tensor: np.ndarray, columns: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -73,7 +155,86 @@ class GGUFTensor:
         qs = qs.view(-1, int(columns))
 
         return d, m, qs
-    
+
+    @staticmethod
+    def unpack_q4_k(tensor: np.ndarray, columns: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Unpack GGML Q4_K into per-group effective scale / min plus the raw uint4 quants.
+
+        A Q4_K block is 144 bytes covering 256 weights = 8 groups of 32:
+
+            2 B   d      FP16 super-block scale S
+            2 B   dmin   FP16 super-block min   M
+            12 B  scales 8 uint6 s_j + 8 uint6 m_j, bit-packed (get_scale_min_k4)
+            128 B qs     256 uint4 q, nibble-packed
+
+        and dequantizes as w^j_i = (S s_j) q^j_i - (M m_j): the min is an unsigned
+        magnitude that is *subtracted*, unlike Q4_1's signed +m.
+
+        What comes back here is the *factored-out* form t_j = S s_j and u_j = M m_j,
+        one pair per group of 32, held exactly in float32 (11-bit FP16 significand
+        times a 6-bit integer needs 17 bits, so the product is exact).  Nothing is
+        re-quantized and no super-block structure survives, which means the result
+        has the same shape and the same 32-column granularity as unpack_q4_1's
+        (d, m, qw) and can go through the model-specific row/column reorders
+        untouched.  The (BF16 S', uint8 s'_j) re-fit of quant.md happens later, in
+        _pack_q4k, over whichever 8 groups actually end up sharing a super-block
+        after those reorders.
+
+        Parameters
+        ----------
+        tensor : np.ndarray
+            Raw Q4_K tensor bytes.
+        columns : int
+            Row length K; must be a multiple of 256.
+
+        Returns
+        -------
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            t (rows, K/32), u (rows, K/32), q (rows, K), all float32.  u is the
+            unsigned magnitude that is *subtracted*: w = t_j q - u_j.
+        """
+        block_size, type_size = GGML_QUANT_SIZES[GGMLQuantizationType.Q4_K]
+        assert columns % block_size == 0, "Columns must be divisible by the Q4_K super-block size"
+        data = tensor.view(np.uint8)
+        n_blocks = data.size // type_size
+        blocks = data.reshape((n_blocks, type_size))
+
+        d, rest = np.hsplit(blocks, [2])
+        dmin, rest = np.hsplit(rest, [2])
+        scales, qs = np.hsplit(rest, [12])
+
+        S = d.view(np.float16).astype(np.float32).reshape(n_blocks)
+        M = dmin.view(np.float16).astype(np.float32).reshape(n_blocks)
+
+        # get_scale_min_k4: groups 0..3 take a plain 6-bit field, groups 4..7 take
+        # a low nibble from scales[j+4] plus the two high bits of scales[j-4].
+        lo = scales[:, 0:4]      # j = 0..3
+        hi = scales[:, 4:8]      # j = 4..7 for the min side, high bits for j = 4..7
+        top = scales[:, 8:12]
+        s6 = np.concatenate([lo & np.uint8(0x3F),
+                             (top & np.uint8(0x0F)) | ((lo >> np.uint8(6)) << np.uint8(4))], axis=1)
+        m6 = np.concatenate([hi & np.uint8(0x3F),
+                             (top >> np.uint8(4)) | ((hi >> np.uint8(6)) << np.uint8(4))], axis=1)
+        s6 = s6.astype(np.float32)
+        m6 = m6.astype(np.float32)
+
+        # qs holds four runs of 32 bytes; within a run the low nibbles are the
+        # first group of 32 and the high nibbles the next one.
+        qb = qs.reshape((n_blocks, 4, 32))
+        q = np.stack([qb & np.uint8(0x0F), qb >> np.uint8(4)], axis=2)  # (nb, 4, 2, 32)
+        q = q.reshape((n_blocks, block_size)).astype(np.float32)
+
+        # Exact in float32: 11-bit significand x 6-bit integer fits in 24 bits.
+        t = (S[:, None] * s6).astype(np.float32)
+        u = (M[:, None] * m6).astype(np.float32)
+
+        n_groups = int(columns // GGUFTensor.Q4_K_GROUP_SIZE)
+        t = torch.from_numpy(t).contiguous().view(-1, n_groups)
+        u = torch.from_numpy(u).contiguous().view(-1, n_groups)
+        q = torch.from_numpy(q).contiguous().view(-1, int(columns))
+
+        return t, u, q
+
     @staticmethod
     def unpack_q8_0(tensors:np.ndarray, columns:int):
         """Split GGML Q8_0 data into scales and quantized values
@@ -195,14 +356,18 @@ class GGUFTensor:
         return w
 
     def get_used_quantization_type(self, default_tensor_type: GGMLQuantizationType) -> GGMLQuantizationType:
-        if self.tensor_type in [GGMLQuantizationType.F32, GGMLQuantizationType.F16, GGMLQuantizationType.BF16, GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q4_1, GGMLQuantizationType.MXFP4]:
+        if self.tensor_type in [GGMLQuantizationType.F32, GGMLQuantizationType.F16, GGMLQuantizationType.BF16, GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q4_1, GGMLQuantizationType.Q4_K, GGMLQuantizationType.MXFP4]:
             return self.tensor_type
         else:
             # For unsupported types (including Q8_0, which is not a native
             # Q4NX packing), we will dequantize and then quantize to
             # default_tensor_type. This makes Q8_0-source GGUFs honor the
             # config target (e.g. Q4_1 main matmuls) instead of keeping every
-            # weight 8-bit.
+            # weight 8-bit. Q4_K is a read-only format here -- nothing can
+            # encode into it -- so a config asking for it as the fallback
+            # target gets Q4_1 instead.
+            if default_tensor_type == GGMLQuantizationType.Q4_K:
+                return GGMLQuantizationType.Q4_1
             return default_tensor_type
 
     def unpack(self, default_tensor_type: GGMLQuantizationType) -> np.ndarray:
@@ -251,6 +416,8 @@ class GGUFTensor:
             return self._requantize_to(default_tensor_type)
         elif self.tensor_type == GGMLQuantizationType.MXFP4:
             return self.unpack_mxfp4(self.data, self.shape[0])
+        elif self.tensor_type == GGMLQuantizationType.Q4_K:
+            return self.unpack_q4_k(self.data, self.shape[0])
         else:
             """
                 If the tensor type is not natively packable as-is (either a
@@ -286,6 +453,12 @@ class GGUFTensor:
                 # needed: just return the dequantized tensor directly,
                 # consistent with the native BF16 branch above.
                 return [w]
+
+            # Q4_K has no encoder in ggml's quantize(); a config requesting it
+            # as the fallback target is honored as Q4_1 (same as the else
+            # branch of get_used_quantization_type).
+            if default_tensor_type == GGMLQuantizationType.Q4_K:
+                default_tensor_type = GGMLQuantizationType.Q4_1
 
             w = w.to(torch.float32).numpy()
             data_quantized = quantize(w, default_tensor_type).copy()

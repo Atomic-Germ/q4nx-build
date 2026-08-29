@@ -3,6 +3,7 @@ from pathlib import Path
 from gguf import GGUFReader
 from .constants import ModelArch, ModelArchNames
 from .constants import ModelArchConfigs
+from .constants import config_filename_for_arch
 from .constants import QWEN35_VARIANT_DIMS
 from .arch_detect import (
     detect_model_family,
@@ -11,7 +12,7 @@ from .arch_detect import (
     resolve_override_candidates,
 )
 from .constants import nearest_qwen35_variant
-from .gguf_tensor import GGUFTensor, GGMLQuantizationType
+from .gguf_tensor import GGUFTensor, GGMLQuantizationType, _refit_one_side
 from typing import List, Dict, Type
 import os
 import json
@@ -59,6 +60,12 @@ class __Q4NX_Converter(ABC):
     backward_name_map: Dict[str, str]
     tensor_q4nx_type_map: Dict[str, GGMLQuantizationType]
 
+    # Optional raw HF safetensor supplement (--hf-tensors / -s) used to
+    # refine GGUF-derived prefill copies.
+    hf_supplement_dir: str | None = None
+    hf_supplement_weight_map: Dict[str, str] = {}
+    hf_supplement_shards: Dict[str, Path] = {}
+
     def __init__(self):
         raise TypeError("This class is virtual, do not instantiate it directly")
 
@@ -85,13 +92,38 @@ class __Q4NX_Converter(ABC):
         """
         Load the GGUF file and parse the tensors.
 
+        The trailing MTP/draft block (the one that carries ``.nextn.``
+        tensors) is dropped in full, universally, for every model:
+        FastFlowLM has no MTP support and no shipped model contains it, so
+        both the draft tensors themselves and the regular layer tensors of
+        that block (e.g. ``blk.24.attn_q.weight``) are excluded. This keeps
+        converted finetunes structurally identical to official Q4NX models
+        (which stop at ``block_count - 1`` real layers).
+
         Returns:
             None
         """
+        mtp_blocks = set()
+        for tensor in self.gguf_reader.tensors:
+            name = tensor.name
+            if ".nextn." not in name:
+                continue
+            mobj = re.match(r"^blk\.(\d+)\.", name)
+            if mobj:
+                mtp_blocks.add(mobj.group(1))
+        if mtp_blocks:
+            print(f"[INFO] Dropping MTP/draft block(s) blk.{' ,blk.'.join(sorted(mtp_blocks))} "
+                  f"for all converters (FastFlowLM has no MTP support)")
         self.gguf_tensors = {}
         for tensor in self.gguf_reader.tensors:
-            self.gguf_tensors[tensor.name] = GGUFTensor(
-                name=tensor.name,
+            name = tensor.name
+            if name.startswith("blk."):
+                block_id = name.split(".")[1]
+                if block_id in mtp_blocks:
+                    print(f"[SKIP] {name} (MTP/draft block, dropped for all models)")
+                    continue
+            self.gguf_tensors[name] = GGUFTensor(
+                name=name,
                 shape=tuple(tensor.shape.tolist()),
                 data=tensor.data,
                 tensor_type=tensor.tensor_type
@@ -111,7 +143,10 @@ class __Q4NX_Converter(ABC):
     def _load_config(self, config_file_path: str = None):
         if config_file_path is None:
             config_file_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs")
-        config_path = os.path.join(config_file_path, ModelArchConfigs[self.model_arch])
+        config_path = os.path.join(
+            config_file_path,
+            config_filename_for_arch(self.model_arch, getattr(self, "requested_quant", None)),
+        )
         print(f"[INFO] Loading Q4NX config from {config_path}")
         self.q4nx_config = json.load(open(config_path))
         self.row_block_size = self.q4nx_config["q4nx_config"]["row_block_size"]
@@ -122,6 +157,8 @@ class __Q4NX_Converter(ABC):
             self.default_tensor_type = GGMLQuantizationType.Q4_0
         elif self.q4nx_config["default_tensor_type"] == "Q4_1":
             self.default_tensor_type = GGMLQuantizationType.Q4_1
+        elif self.q4nx_config["default_tensor_type"] == "Q4_K":
+            self.default_tensor_type = GGMLQuantizationType.Q4_K
         elif self.q4nx_config["default_tensor_type"] == "Q8_0":
             self.default_tensor_type = GGMLQuantizationType.Q8_0
         else:
@@ -147,6 +184,8 @@ class __Q4NX_Converter(ABC):
             return GGMLQuantizationType.Q4_0
         elif q4nx_name == "Q4_1":
             return GGMLQuantizationType.Q4_1
+        elif q4nx_name == "Q4_K":
+            return GGMLQuantizationType.Q4_K
         elif q4nx_name == "Q8_0":
             return GGMLQuantizationType.Q8_0
         elif q4nx_name == "BF16":
@@ -254,6 +293,48 @@ class __Q4NX_Converter(ABC):
             shards = ["model.safetensors"]
         self.hf_shards = {s: self.hf_dir / s for s in shards}
         print(f"[INFO] Loaded {len(self.weight_map)} HF tensors across {len(shards)} shards")
+
+    def _setup_hf_supplement(self, source: str):
+        """Resolve an optional raw HF safetensor supplement source.
+
+        Used when converting a GGUF so that GGUF-derived bf16 prefill copies
+        (alpha/beta) can be refined from the raw FP/BF16 weights. Accepts a
+        local directory or an HF repo id (downloaded on demand). Sets
+        ``hf_supplement_dir`` + weight maps; other tensors are untouched.
+        """
+        if not source:
+            return
+        path = Path(source)
+        if not path.is_dir():
+            path = self._resolve_source(source)
+        self.hf_supplement_dir = str(path)
+        idx_path = path / "model.safetensors.index.json"
+        if idx_path.is_file():
+            index = json.loads(idx_path.read_text())
+            self.hf_supplement_weight_map = index["weight_map"]
+            shards = sorted(set(self.hf_supplement_weight_map.values()))
+        else:
+            single = path / "model.safetensors"
+            if not single.is_file():
+                print(f"[WARN] HF supplement {path}: no model.safetensors found; "
+                      f"prefill copies will stay GGUF-derived")
+                self.hf_supplement_dir = None
+                self.hf_supplement_weight_map = {}
+                self.hf_supplement_shards = {}
+                return
+            with safe_open(single, framework="torch") as f:
+                self.hf_supplement_weight_map = {k: "model.safetensors" for k in f.keys()}
+            shards = ["model.safetensors"]
+        self.hf_supplement_shards = {s: path / s for s in shards}
+        print(f"[INFO] HF supplement ready: {len(self.hf_supplement_weight_map)} tensors from {path}")
+
+    def _load_supplement_tensor(self, name: str) -> torch.Tensor | None:
+        """Load a single raw tensor from the HF supplement (None if absent/unset)."""
+        if not self.hf_supplement_dir or name not in self.hf_supplement_weight_map:
+            return None
+        shard = self.hf_supplement_weight_map[name]
+        with safe_open(self.hf_supplement_shards[shard], framework="torch") as f:
+            return f.get_tensor(name).contiguous()
 
     def _load_tensor(self, name: str) -> torch.Tensor:
         shard = self.weight_map[name]
@@ -584,7 +665,17 @@ class __Q4NX_Converter(ABC):
             
             
     def _pack(self, d: torch.Tensor, m: torch.Tensor = None, qw: torch.Tensor = None, tensor_type: GGMLQuantizationType = None) -> torch.Tensor:
-        if tensor_type == GGMLQuantizationType.Q8_0:
+        if tensor_type in (GGMLQuantizationType.F32, GGMLQuantizationType.F16,
+                           GGMLQuantizationType.BF16):
+            # Norms, ssm_conv1d and friends ship unquantized and stay that way:
+            # there is nothing to pack, the tensor just goes out as bf16.
+            return d.to(torch.bfloat16)
+        elif tensor_type == GGMLQuantizationType.Q4_K:
+            # Same shapes as Q4_1, different semantics: d/m are the effective
+            # per-group scale t_j and *subtracted* min u_j, and the super-block
+            # re-fit happens inside _pack_q4k. Dispatch is by type, not by arity.
+            return self._pack_q4k(d, m, qw)
+        elif tensor_type == GGMLQuantizationType.Q8_0:
             # Q8NX format: scale array (d, bf16) followed by int8 data, no min
             # array. This matches the official Q8_0-packed tensors (alpha/beta/
             # out_proj/lm_head) which use 8704-byte chunks (256 blocks x 34).
@@ -710,25 +801,18 @@ class __Q4NX_Converter(ABC):
                     c=self.col_block_size // Q8_group_size                
                 ).contiguous()
             
-            assert self.row_block_size % self.parallel_size == 0
-            # similar, for the data block
+            # The kernel keeps the whole row span of a block resident at once
+            # (PARALLEL_ROWS == QXNX_ROW_BLOCK_SIZE == row_block_size), so one
+            # column is row_block_size contiguous int8 and columns simply ascend:
+            # a block is plain column major, with no parallel-strided re-order.
             data = rearrange(
                 data,
-                "(row_div_r r) (col_div_c c) -> row_div_r col_div_c r c",
+                "(row_div_r r) (col_div_c c) -> row_div_r col_div_c (c r)",
                 r=self.row_block_size,
-                c=self.col_block_size 
+                c=self.col_block_size
             ).contiguous()
-            # at this point, data is in row major order within each block
-            
-            data = rearrange(
-                data,
-                #" row_div_r col_div_c (r_div_parallel parallel) c -> row_div_r col_div_c (c r_div_parallel parallel)",
-                
-                "row_div_r col_div_c (r_div_parallel parallel) c -> row_div_r col_div_c (r_div_parallel c parallel)",
-                parallel=self.parallel_size,
-            )
-            # at this point, data is in column major order within each block, and strided by parallel size
-            
+            # at this point, data is in column major order within each block
+
             # now, convert scales from float16 to bfloat16
             assert(scales.dtype == torch.float16)
             scales = scales.to(torch.bfloat16)
@@ -810,13 +894,12 @@ class __Q4NX_Converter(ABC):
             # dm done
 
             qw = rearrange(qw, '(p r) (q c) -> (p q) r c', r = self.row_block_size, c = self.col_block_size)
-            qw = rearrange(qw, 'n (g r) c -> n g r c', r = self.parallel_size)
-            qw = rearrange(qw, 'n g (r b) c -> n g c r b', b = NUM_int4_in_byte).contiguous().to(torch.int8)
+            qw = rearrange(qw, 'n (r b) c -> n c r b', b = NUM_int4_in_byte).contiguous().to(torch.int8)
 
             qw[..., 1] = torch.bitwise_and(torch.bitwise_left_shift(qw[..., 1], 4), 0xF0)
             qw[..., 0] = torch.bitwise_or(torch.bitwise_and(qw[..., 0], 0x0F), qw[..., 1])
             qw = qw[..., 0].contiguous()
-            qw = rearrange(qw, 'n g c r -> n (g c r)').contiguous()
+            qw = rearrange(qw, 'n c r -> n (c r)').contiguous()
         else:
             # chunk wise
             d = rearrange(d, '(p r) (q c) -> p q (c r)', r = self.row_block_size, c = self.col_block_size // Q4_group_size).contiguous()
@@ -824,13 +907,12 @@ class __Q4NX_Converter(ABC):
             # dm done
 
             qw = rearrange(qw, '(p r) (q c) -> p q r c', r = self.row_block_size, c = self.col_block_size)
-            qw = rearrange(qw, 'p q (g r) c -> p q g r c', r = self.parallel_size)
-            qw = rearrange(qw, 'p q g (r b) c -> p q g c r b', b = NUM_int4_in_byte).contiguous().to(torch.int8)
+            qw = rearrange(qw, 'p q (r b) c -> p q c r b', b = NUM_int4_in_byte).contiguous().to(torch.int8)
 
             qw[..., 1] = torch.bitwise_and(torch.bitwise_left_shift(qw[..., 1], 4), 0xF0)
             qw[..., 0] = torch.bitwise_or(torch.bitwise_and(qw[..., 0], 0x0F), qw[..., 1])
             qw = qw[..., 0].contiguous()
-            qw = rearrange(qw, 'p q g c r -> p q (g c r)').contiguous()
+            qw = rearrange(qw, 'p q c r -> p q (c r)').contiguous()
         d = d.to(torch.bfloat16).view(torch.int8)
         m = m.to(torch.bfloat16).view(torch.int8)
         qw = qw.view(torch.int8)
@@ -843,8 +925,95 @@ class __Q4NX_Converter(ABC):
 
         merged = torch.from_numpy(merged)
         return merged
-    
-    
+
+    def _pack_q4k(self, t: torch.Tensor, u: torch.Tensor, q: torch.Tensor,
+                  search: int = 3) -> torch.Tensor:
+        """Pack the FLM q4_k format (uint8 s'/m' per group + bf16 S'/M' per super-block).
+
+        Input is what GGUFTensor.unpack_q4_k returns, *after* any model-specific
+        reorder: the effective per-group scale t_j and subtracted min u_j in exact
+        float32, shape (rows, cols // 32), plus the uint4 quants (rows, cols).  The
+        (BF16 P', uint8 p'_j) re-fit of quant.md is done here, per 256-column
+        super-block, so it always fits the 8 groups that really share a super-block
+        in the packed output -- a reorder that shuffles columns at a granularity
+        finer than 256 (ssm_out_proj moves 128-column chunks) would otherwise leave
+        the super-block metadata unrepresentable.
+
+        Mirrors `q4k_block_t` in the decoding kernels' model_spec.h, one struct
+        per row_block_size x col_block_size chunk, everything column major over
+        the chunk (the whole row span is resident at once, so there is no
+        parallel-strided re-order):
+
+            uint8 scales[col_block_size // Q4_group_size][row_block_size]
+            uint8 mins  [col_block_size // Q4_group_size][row_block_size]
+            uint4 qs    [col_block_size][row_block_size // NUM_int4_in_byte]
+            bf16  S     [col_block_size // Q4K_super_block_size][row_block_size]
+            bf16  M     [col_block_size // Q4K_super_block_size][row_block_size]
+
+        With the shipping 32x256 chunk that is 256 + 256 + 4096 + 64 + 64 = 4736 B,
+        i.e. 4.625 bits per weight, matching get_quantization_byte_size().
+
+        GGUF's Q4_K subtracts the min (w = S' s'_j q - M' m'_j) while the kernel
+        adds both accumulators, so M' is stored negated here.
+        """
+        Q4_group_size = 32
+        Q4K_super_block_size = 256
+        NUM_int4_in_byte = 2
+
+        t = t.to(torch.float32).contiguous()
+        u = u.to(torch.float32).contiguous()
+        q = q.contiguous()
+
+        cols = q.shape[-1]
+        assert cols % Q4K_super_block_size == 0, "Q4_K needs a multiple of 256 columns"
+        assert self.col_block_size % Q4K_super_block_size == 0
+
+        if cols % self.col_block_size != 0:
+            cols_padded = round_up_to_multiple(cols, self.col_block_size)
+            t = F.pad(t, (0, (cols_padded - cols) // Q4_group_size), "constant", 0)
+            u = F.pad(u, (0, (cols_padded - cols) // Q4_group_size), "constant", 0)
+            q = F.pad(q, (0, cols_padded - cols), "constant", 0)
+
+        # Re-fit each side onto (BF16 super-block value, uint8 per-group value).
+        groups_per_super = Q4K_super_block_size // Q4_group_size
+        S, s8 = _refit_one_side(t.numpy().reshape(-1, groups_per_super), search=search)
+        M, m8 = _refit_one_side(u.numpy().reshape(-1, groups_per_super), search=search)
+        S = torch.from_numpy(S).view(t.shape[0], -1)
+        M = torch.from_numpy(M).view(u.shape[0], -1)
+        s8 = torch.from_numpy(s8).view_as(t)
+        m8 = torch.from_numpy(m8).view_as(u)
+
+        # scales / mins: one group of 32 columns contributes row_block_size uint8,
+        # groups ascending -- the same block layout the bf16 scales use in q4nx.
+        s8 = rearrange(s8, '(p r) (u c) -> p u (c r)', r=self.row_block_size,
+                       c=self.col_block_size // Q4_group_size).contiguous()
+        m8 = rearrange(m8, '(p r) (u c) -> p u (c r)', r=self.row_block_size,
+                       c=self.col_block_size // Q4_group_size).contiguous()
+        # S / M: one entry per row per super-block; a 256-column chunk holds exactly one.
+        S = rearrange(S, '(p r) (u c) -> p u (c r)', r=self.row_block_size,
+                      c=self.col_block_size // Q4K_super_block_size).contiguous()
+        M = rearrange(M, '(p r) (u c) -> p u (c r)', r=self.row_block_size,
+                      c=self.col_block_size // Q4K_super_block_size).contiguous()
+
+        # quants: one column = row_block_size nibbles, rows paired into a byte with
+        # the even row in the low nibble, columns ascending.
+        q = rearrange(q, '(p r) (u c) -> p u r c', r=self.row_block_size, c=self.col_block_size)
+        q = rearrange(q, 'p u (r b) c -> p u c r b', b=NUM_int4_in_byte).contiguous().to(torch.int8)
+        q[..., 1] = torch.bitwise_and(torch.bitwise_left_shift(q[..., 1], 4), 0xF0)
+        q[..., 0] = torch.bitwise_or(torch.bitwise_and(q[..., 0], 0x0F), q[..., 1])
+        q = rearrange(q[..., 0].contiguous(), 'p u c r -> p u (c r)').contiguous()
+
+        s8 = s8.to(torch.uint8).view(torch.int8).numpy()
+        m8 = m8.to(torch.uint8).view(torch.int8).numpy()
+        S = S.to(torch.bfloat16).view(torch.int8).numpy()
+        M = (-M).to(torch.bfloat16).view(torch.int8).numpy()   # kernel adds the min path
+        q = q.view(torch.int8).numpy()
+
+        merged = torch.from_numpy(np.concatenate([s8, m8, q, S, M], axis=-1).copy())
+        if not self.keep_block_in_2D:
+            merged = merged.reshape(-1, merged.shape[-1])
+        return merged
+
     
     def _multi_modal_mm_weight_rearrange(self, weight: torch.Tensor,
                                             kernel_mm_K:int|None, kernel_mm_N:int|None
@@ -1232,12 +1401,17 @@ def get_registered_models() -> Dict[ModelArch, Type['__Q4NX_Converter']]:
     return _MODEL_REGISTRY.copy()
 
 
-def create_converter(gguf_path: str, override_model_arch:str) -> __Q4NX_Converter:
+def create_converter(gguf_path: str, override_model_arch: str, quant: str | None = None,
+                     hf_tensors: str | None = None) -> __Q4NX_Converter:
     """
     Factory function to create the appropriate converter based on the GGUF model architecture.
     
     Args:
         gguf_path: Path to the GGUF file
+        quant: Optional target Q4NX quantization ('q4_1', 'q4_k', ...). Selects
+            a quant-specific Q4NX config (see config_filename_for_arch).
+        hf_tensors: Optional raw HF safetensor source (local dir or repo id)
+            used to refine GGUF-derived prefill bf16 copies.
         
     Returns:
         An instance of the appropriate converter class
@@ -1263,14 +1437,22 @@ def create_converter(gguf_path: str, override_model_arch:str) -> __Q4NX_Converte
         )
     
     converter_class = _MODEL_REGISTRY[model_arch]
-
     converter_instance = converter_class(reader)
+    if hf_tensors:
+        converter_instance._setup_hf_supplement(hf_tensors)
+    if quant:
+        # The constructor already loaded the default config during __init__;
+        # re-load it against the requested quant (re-reads the JSON and
+        # rebuilds the name/type maps, so the config selection is authoritative).
+        converter_instance.requested_quant = quant
+        converter_instance._load_config()
 
     return converter_instance
 
 
 def create_hf_converter(
-    hf_source: str, override_model_arch: str = "", config_json_path: str | None = None
+    hf_source: str, override_model_arch: str = "", config_json_path: str | None = None,
+    quant: str | None = None,
 ) -> __Q4NX_Converter:
     """Factory for HF-safetensors-source converters.
 
@@ -1306,7 +1488,11 @@ def create_hf_converter(
         )
     converter_class = _MODEL_REGISTRY[model_arch]
     print(f"[INFO] HF source detected as {ModelArchNames.get(model_arch, model_arch)}")
-    return converter_class(hf_source, config_json_path=config_json_path)
+    converter_instance = converter_class(hf_source, config_json_path=config_json_path)
+    if quant:
+        converter_instance.requested_quant = quant
+        converter_instance._load_config()
+    return converter_instance
 
 
 def _detect_hf_arch(hf_source: str) -> ModelArch | None:

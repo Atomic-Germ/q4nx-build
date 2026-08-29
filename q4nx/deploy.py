@@ -325,7 +325,7 @@ def deploy_model(
     if not base_entry:
         family = ARCH_TO_FAMILY.get(model_arch, "")
         entry.setdefault("details", {}).setdefault("family", family)
-        entry.setdefault("flm_min_version", "0.9.45")
+        entry.setdefault("flm_min_version", "1.0.1")
 
     user_registry = get_user_registry_path()
     register_model(tag, entry, user_registry, system_list)

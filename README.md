@@ -403,7 +403,7 @@ Add a new entry under `models`:
       "url": "https://huggingface.co/FastFlowLM/Qwen3-VL-4B-Custom/resolve/v0.9.22-faster-q4-1",
       "file_url": "https://huggingface.co/api/models/FastFlowLM/Qwen3-VL-4B-Custom/tree/v0.9.22-faster-q4-1",
       "size": 4000000000,
-      "flm_min_version": "0.9.22",
+      "flm_min_version": "1.0.1",
       "files": [
          "config.json",
          "model.q4nx",
@@ -441,7 +441,7 @@ Add a new sub-entry under the existing `qwen3vl-it` model family.
       "url": "https://huggingface.co/FastFlowLM/Qwen3-VL-4B-Custom/resolve/v0.9.22-faster-q4-1",
       "file_url": "https://huggingface.co/api/models/FastFlowLM/Qwen3-VL-4B-Custom/tree/v0.9.22-faster-q4-1",
       "size": 4000000000,
-      "flm_min_version": "0.9.22",
+      "flm_min_version": "1.0.1",
       "files": [
          "config.json",
          "model.q4nx",
