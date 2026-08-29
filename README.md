@@ -7,15 +7,15 @@ Based on the configuration, the converter supports several model architectures, 
 - Gemma 3
 - GPT-OSS
 - LFM 2
+- LFM 2.5
 - LLaMA
 - Phi-4
 - Qwen 2 / Qwen 2.5
 - Qwen 2 VL
 - Qwen 3
 - Qwen 3 VL
-- Qwen 3.5
-- Qwen 3.5 MoE
-- Qwen 3.6 MoE
+- Qwen 3.x
+- Qwen 3.x MoE
 
 ### Weight Type Support
 - `language`: supported for model families in `configs/`
@@ -63,7 +63,7 @@ file path. The card body is mined for the upstream repo id (from_pretrained / vl
 mentions), which then feeds the same derivation:
 
 ```bash
-q4nx-build -i ./GRaPE-1.5
+q4nx-build -i tests/GRaPE-1.5
 # [INFO] Card names upstream repo: Sweaterdog/GRaPE-1.5
 ```
 
