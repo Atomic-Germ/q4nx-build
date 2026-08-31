@@ -28,6 +28,7 @@ Run (in an environment with torch + transformers):
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sys
 from pathlib import Path
@@ -47,7 +48,8 @@ FLM_ONLY = {
 }
 
 
-def load_q4nx_weights(model_dir: Path, cfg: dict) -> dict[str, torch.Tensor]:
+def load_q4nx_weights(model_dir: Path, cfg: dict,
+                      dtype: torch.dtype = torch.bfloat16) -> dict[str, torch.Tensor]:
     """Q4NX file -> a transformers state_dict, in HF layout.
 
     Undoes the two things the converter does to layout: the tile packing, and
@@ -75,7 +77,7 @@ def load_q4nx_weights(model_dir: Path, cfg: dict) -> dict[str, torch.Tensor]:
 
     for name, tensor in packed.items():
         if tensor.dtype == torch.bfloat16:
-            state[name] = tensor.float()  # embed_tokens, norms
+            state[name] = tensor.to(dtype)  # embed_tokens, norms
             continue
         if name == "lm_head.weight":
             rows, cols = vocab, hidden
@@ -90,7 +92,10 @@ def load_q4nx_weights(model_dir: Path, cfg: dict) -> dict[str, torch.Tensor]:
         if "q_proj" in name or "k_proj" in name:
             # Inverse of the converter's '(g p q) c -> (g q p) c'.
             w = rearrange(w, "(g q p) c -> (g p q) c", p=head_dim // 2, q=2).contiguous()
-        state[name] = w
+        # Narrow immediately: a 3B model dequantized to fp32 is 12.8 GB of
+        # state_dict before a single model is built.
+        state[name] = w.to(dtype)
+        del w
 
     return state
 
@@ -116,7 +121,10 @@ def main() -> int:
     ap.add_argument("--config", required=True, help="granite config.json (for dimensions)")
     ap.add_argument("--tokenizer", default="", help="dir holding tokenizer.json (default: model_dir)")
     ap.add_argument("--prompt", default="The capital city of France is")
-    ap.add_argument("--max-new-tokens", type=int, default=40)
+    ap.add_argument("--max-new-tokens", type=int, default=16)
+    ap.add_argument("--dtype", default="bfloat16",
+                    choices=["bfloat16", "float32"],
+                    help="bf16 keeps a 3B model inside a 30 GB machine")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
@@ -131,8 +139,17 @@ def main() -> int:
 
     print(f"[INFO] head_dim {head_dim}, attention_multiplier {attn_mult}, q_proj fold {q_fold}")
 
-    state = load_q4nx_weights(model_dir, cfg)
-    print(f"[INFO] loaded {len(state)} tensors from model.q4nx")
+    dtype = getattr(torch, args.dtype)
+    state = load_q4nx_weights(model_dir, cfg, dtype)
+    print(f"[INFO] loaded {len(state)} tensors from model.q4nx as {args.dtype}")
+
+    tok_dir = args.tokenizer or str(model_dir)
+    tokenizer = AutoTokenizer.from_pretrained(tok_dir)
+    ids = tokenizer(args.prompt, return_tensors="pt").input_ids
+
+    # The two models are built and freed one at a time: a 3B model is ~6.4 GB
+    # at bf16 and the state_dict is another 6.4 GB, so holding both models at
+    # once does not fit in a 30 GB machine.
 
     # --- path A: the folded weights through a stock Llama (what FLM will do)
     llama_cfg = dict(cfg)
@@ -141,26 +158,35 @@ def main() -> int:
                 "architectures", "rope_parameters"):
         llama_cfg.pop(key, None)
     llama_cfg["head_dim"] = head_dim
-    llama = build(LlamaForCausalLM, LlamaConfig, llama_cfg, state)
+    llama = build(LlamaForCausalLM, LlamaConfig, llama_cfg, state, dtype)
+    with torch.no_grad():
+        a = llama(ids).logits.float()
+    print("[INFO] llama path forward done")
+
+    print("[CHECK 2] generation through the llama path")
+    with torch.no_grad():
+        out = llama.generate(ids, max_new_tokens=args.max_new_tokens, do_sample=False)
+    text = tokenizer.decode(out[0], skip_special_tokens=True)
+    print(f"          {text!r}")
+    del llama
+    gc.collect()
 
     # --- path B: fold divided back out, through the real Granite
-    unfolded = dict(state)
     if q_fold != 1.0:
-        for name in list(unfolded):
+        for name in list(state):
             if name.endswith("self_attn.q_proj.weight"):
-                unfolded[name] = unfolded[name] / q_fold
+                state[name] = state[name] / q_fold
     granite_cfg = dict(cfg)
     granite_cfg.pop("rope_parameters", None)
     granite_cfg.pop("architectures", None)
-    granite = build(GraniteForCausalLM, GraniteConfig, granite_cfg, unfolded)
-
-    tok_dir = args.tokenizer or str(model_dir)
-    tokenizer = AutoTokenizer.from_pretrained(tok_dir)
-    ids = tokenizer(args.prompt, return_tensors="pt").input_ids
-
+    granite = build(GraniteForCausalLM, GraniteConfig, granite_cfg, state, dtype)
+    del state
+    gc.collect()
     with torch.no_grad():
-        a = llama(ids).logits
-        b = granite(ids).logits
+        b = granite(ids).logits.float()
+    del granite
+    gc.collect()
+    print("[INFO] granite path forward done")
 
     flat_a, flat_b = a.flatten().double(), b.flatten().double()
     cos = float(torch.dot(flat_a, flat_b) / (flat_a.norm() * flat_b.norm()))
@@ -172,13 +198,6 @@ def main() -> int:
     print(f"          max abs diff    : {max_abs:.3e}")
     print(f"          same argmax     : {'yes' if agree else 'NO'}")
     fold_ok = cos > 0.9999 and agree
-
-    print()
-    print("[CHECK 2] generation through the llama path")
-    with torch.no_grad():
-        out = llama.generate(ids, max_new_tokens=args.max_new_tokens, do_sample=False)
-    text = tokenizer.decode(out[0], skip_special_tokens=True)
-    print(f"          {text!r}")
 
     print()
     if not fold_ok:

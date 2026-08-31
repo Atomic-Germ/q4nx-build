@@ -28,11 +28,17 @@ G42_HEAD_DIM = 64  # hidden_size 2560 / num_attention_heads 40
 
 
 def _field(value=None, raw: str = None, name: str = ""):
-    """GGUFReader field stand-in: raw string access + optional .contents()."""
+    """GGUFReader field stand-in: raw string access plus `.contents()`.
+
+    A real reader returns the string from `contents()` for a string field, and
+    `model_assets._gguf_field` trusts `contents()` first. A fake that returned
+    None there would silently make every arch-prefixed lookup miss.
+    """
+    contents_value = value if value is not None else raw
     return SimpleNamespace(
         parts=[(raw or "").encode()],
         data=[0] if raw is not None else [],
-        contents=(lambda: value),
+        contents=(lambda: contents_value),
         name=name,
     )
 
@@ -202,3 +208,127 @@ class GraniteHfPathTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GraniteConfigReconciliationTest(unittest.TestCase):
+    """The skeleton config is the BASE model's, and it can describe a different
+    checkpoint while every dimension still matches.
+
+    granite-4.2-3b's GGUF points `general.base_model.0.repo_url` at
+    granite-4.1-3b-base, whose config carries 12.0 / 0.22 / 10.0 / tied against
+    4.2's 1.0 / 1.0 / 1.0 / untied. Nothing crashed; the emitted directory
+    simply described a model it did not contain.
+    """
+
+    @staticmethod
+    def _skeleton():
+        # The real granite-4.1-3b-base values.
+        return {
+            "attention_multiplier": 0.015625,
+            "embedding_multiplier": 12.0,
+            "residual_multiplier": 0.22,
+            "logits_scaling": 10.0,
+            "tie_word_embeddings": True,
+            "bos_token_id": 100257,
+            "pad_token_id": 100256,
+            "rms_norm_eps": 1e-05,
+            "hidden_size": 2560,
+        }
+
+    @staticmethod
+    def _reader(tensor_names=("output.weight",), **overrides):
+        meta = dict(
+            attention__scale=G42_ATTENTION_MULTIPLIER,
+            embedding_scale=1.0,
+            residual_scale=1.0,
+            logit_scale=1.0,
+            rope__dimension_count=G42_HEAD_DIM,
+            attention__head_count=40,
+            embedding_length=2560,
+        )
+        meta.update(overrides)
+        reader = FakeReader(architecture="granite", tensor_names=tensor_names, **meta)
+        for key, value in (("tokenizer.ggml.bos_token_id", 100283),
+                           ("tokenizer.ggml.eos_token_id", 100257),
+                           ("tokenizer.ggml.padding_token_id", 100257)):
+            reader.fields[key] = _field(value=value, name=key)
+        return reader
+
+    def test_multipliers_describe_the_folded_weights(self):
+        from q4nx.model_assets import apply_granite_fold_to_config
+
+        cfg = self._skeleton()
+        apply_granite_fold_to_config(cfg, self._reader())
+        # After folding the file holds Llama-scaled weights, so the config must
+        # say so: the stock head_dim**-0.5, and neutral everywhere else.
+        self.assertAlmostEqual(cfg["attention_multiplier"], G42_HEAD_DIM ** -0.5)
+        self.assertEqual(cfg["embedding_multiplier"], 1.0)
+        self.assertEqual(cfg["residual_multiplier"], 1.0)
+        self.assertEqual(cfg["logits_scaling"], 1.0)
+
+    def test_originals_are_kept_for_audit(self):
+        from q4nx.model_assets import apply_granite_fold_to_config
+
+        cfg = self._skeleton()
+        apply_granite_fold_to_config(cfg, self._reader())
+        self.assertAlmostEqual(
+            cfg["q4nx_folded_multipliers"]["attention_multiplier"],
+            G42_ATTENTION_MULTIPLIER,
+        )
+
+    def test_tie_word_embeddings_comes_from_the_gguf_tensors(self):
+        from q4nx.model_assets import apply_granite_fold_to_config
+
+        cfg = self._skeleton()
+        apply_granite_fold_to_config(cfg, self._reader(tensor_names=("output.weight",)))
+        self.assertFalse(cfg["tie_word_embeddings"])
+
+        cfg = self._skeleton()
+        cfg["tie_word_embeddings"] = False
+        apply_granite_fold_to_config(cfg, self._reader(tensor_names=("token_embd.weight",)))
+        self.assertTrue(cfg["tie_word_embeddings"])
+
+    def test_token_ids_are_corrected_from_the_gguf(self):
+        from q4nx.model_assets import reconcile_config_with_gguf
+
+        cfg = self._skeleton()
+        reconcile_config_with_gguf(cfg, self._reader())
+        self.assertEqual(cfg["bos_token_id"], 100283)
+        self.assertEqual(cfg["pad_token_id"], 100257)
+
+    def test_eos_list_containing_the_gguf_id_is_left_alone(self):
+        from q4nx.model_assets import reconcile_config_with_gguf
+
+        cfg = self._skeleton()
+        cfg["eos_token_id"] = [100257, 100263]
+        reconcile_config_with_gguf(cfg, self._reader())
+        self.assertEqual(cfg["eos_token_id"], [100257, 100263])
+
+    def test_float32_roundtrip_is_not_reported_as_a_mismatch(self):
+        # 1e-5 through float32 reads back as 9.999999747378752e-06. Warning on
+        # that trains people to ignore the warning that matters.
+        from q4nx.model_assets import reconcile_config_with_gguf
+        import io as _io
+        from contextlib import redirect_stdout
+
+        cfg = self._skeleton()
+        reader = self._reader(attention__layer_norm_rms_epsilon=9.999999747378752e-06)
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            reconcile_config_with_gguf(cfg, reader)
+        self.assertNotIn("rms_norm_eps", buf.getvalue())
+
+    def test_a_real_dimension_mismatch_is_reported(self):
+        from q4nx.model_assets import reconcile_config_with_gguf
+        import io as _io
+        from contextlib import redirect_stdout
+
+        cfg = self._skeleton()
+        cfg["hidden_size"] = 4096  # skeleton disagrees with the GGUF's 2560
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            reconcile_config_with_gguf(cfg, self._reader())
+        out = buf.getvalue()
+        self.assertIn("hidden_size", out)
+        # reported, not rewritten -- padded families depend on keeping theirs
+        self.assertEqual(cfg["hidden_size"], 4096)

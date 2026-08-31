@@ -77,13 +77,14 @@ def main() -> int:
     folds = conv._fold_factors() if hasattr(conv, "_fold_factors") else {}
     head_dim = conv._head_dim() if hasattr(conv, "_head_dim") else None
 
+    # GGUF stores dimensions in ggml `ne` order, fastest axis first: for a 2D
+    # weight that is [K, N] -- shape[0] is the input width and shape[1] the
+    # output rows, the opposite of the torch convention used everywhere below.
     rows_of = {}
     for tensor in reader.tensors:
         name = conv.forward_name_map.get(tensor.name)
-        if name is not None:
-            cols = int(tensor.shape[0])
-            rows_of[name] = (int(tensor.data.size // cols) if tensor.data.ndim == 1
-                             else int(tensor.shape[1]), cols, tensor)
+        if name is not None and len(tensor.shape) >= 2:
+            rows_of[name] = (int(tensor.shape[1]), int(tensor.shape[0]), tensor)
 
     worst = ("", 1.0)
     failures = []
