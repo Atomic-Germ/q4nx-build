@@ -332,3 +332,188 @@ class GraniteConfigReconciliationTest(unittest.TestCase):
         self.assertIn("hidden_size", out)
         # reported, not rewritten -- padded families depend on keeping theirs
         self.assertEqual(cfg["hidden_size"], 4096)
+
+
+class GranitePadHiddenTest(unittest.TestCase):
+    """--pad-hidden widens the residual stream onto a width the engine has a
+    compiled design for. The padded lanes must be inert, and RMSNorm's width
+    term must be corrected -- that second part is the one that is easy to skip
+    and impossible to see in a shape check.
+    """
+
+    @staticmethod
+    def _conv(pad=3072, norm_fix=True):
+        conv = _g42()
+        conv.pad_hidden = pad
+        conv.pad_norm_fix = norm_fix
+        return conv
+
+    def test_plan_reports_source_target_and_norm_scale(self):
+        hidden, target, scale = self._conv()._pad_plan()
+        self.assertEqual((hidden, target), (2560, 3072))
+        self.assertAlmostEqual(scale, math.sqrt(2560 / 3072))
+
+    def test_norm_scale_cancels_the_wider_denominator(self):
+        # RMSNorm: y = x*w / sqrt(mean(x^2) + eps). Widening H -> H' with
+        # eps' = eps*H/H' makes the radicand scale by H/H', so the weight scale
+        # sqrt(H/H') cancels it exactly -- for every input, not approximately.
+        H, Hp, eps = 2560, 3072, 1e-5
+        _, _, scale = self._conv()._pad_plan()
+        S = 12345.0                                     # any sum of squares
+        before = 1.0 / math.sqrt(S / H + eps)
+        after = scale / math.sqrt(S / Hp + eps * H / Hp)
+        self.assertAlmostEqual(before, after, places=12)
+
+    def test_no_pad_norm_fix_leaves_the_scale_at_one(self):
+        _, _, scale = self._conv(norm_fix=False)._pad_plan()
+        self.assertEqual(scale, 1.0)
+
+    def test_no_plan_when_target_equals_hidden_or_unset(self):
+        self.assertIsNone(self._conv(pad=2560)._pad_plan())
+        self.assertIsNone(self._conv(pad=None)._pad_plan())
+
+    def test_shrinking_is_refused(self):
+        with self.assertRaises(ValueError):
+            self._conv(pad=2048)._pad_plan()
+
+    def test_non_tile_aligned_target_is_refused(self):
+        # A Q4NX tile is 32 rows x 256 K; a target that is not a whole number
+        # of column-blocks would need partial tiles.
+        with self.assertRaises(ValueError):
+            self._conv(pad=3000)._pad_plan()
+
+    def test_pad_cols_keeps_original_and_zeroes_the_rest(self):
+        d = torch.full((4, 2), 0.5)
+        m = torch.full((4, 2), -0.25)
+        qs = torch.full((4, 64), 7, dtype=torch.int8)
+        nd, nm, nq = Granite._pad_unpacked((d, m, qs), cols=128)
+        self.assertEqual(nq.shape, (4, 128))
+        self.assertEqual(nd.shape, (4, 4))            # 128/32 groups
+        self.assertTrue(torch.equal(nq[:, :64], qs))
+        self.assertTrue(torch.all(nq[:, 64:] == 0))
+        self.assertTrue(torch.all(nd[:, 2:] == 0))
+        self.assertTrue(torch.all(nm[:, 2:] == 0))
+
+    def test_pad_rows_keeps_original_and_zeroes_the_rest(self):
+        d = torch.full((4, 2), 0.5)
+        m = torch.full((4, 2), -0.25)
+        qs = torch.full((4, 64), 7, dtype=torch.int8)
+        nd, nm, nq = Granite._pad_unpacked((d, m, qs), rows=8)
+        self.assertEqual(nq.shape, (8, 64))
+        self.assertTrue(torch.equal(nq[:4], qs))
+        self.assertTrue(torch.all(nq[4:] == 0))
+        self.assertTrue(torch.all(nd[4:] == 0))
+
+    def test_padded_groups_dequantize_to_exactly_zero(self):
+        # w = code*d + m, and the padded groups get code 0, d 0, m 0.
+        d = torch.full((1, 2), 0.5)
+        m = torch.full((1, 2), -0.25)
+        qs = torch.full((1, 64), 7, dtype=torch.int8)
+        nd, nm, nq = Granite._pad_unpacked((d, m, qs), cols=128)
+        w = nq.float() * nd.repeat_interleave(32, 1) + nm.repeat_interleave(32, 1)
+        self.assertTrue(torch.all(w[:, 64:] == 0.0))
+
+    def test_which_tensors_pad_on_which_axis(self):
+        # o_proj and down_proj WRITE into the residual stream, so hidden is
+        # their output axis; everything else reads from it.
+        for name in ("model.layers.3.self_attn.q_proj.weight",
+                     "model.layers.3.mlp.up_proj.weight", "lm_head.weight"):
+            self.assertTrue(Granite._endswith_any(name, Granite._PAD_COLS), name)
+            self.assertFalse(Granite._endswith_any(name, Granite._PAD_ROWS), name)
+        for name in ("model.layers.3.self_attn.o_proj.weight",
+                     "model.layers.3.mlp.down_proj.weight"):
+            self.assertTrue(Granite._endswith_any(name, Granite._PAD_ROWS), name)
+            self.assertFalse(Granite._endswith_any(name, Granite._PAD_COLS), name)
+
+
+class GranitePadConfigTest(unittest.TestCase):
+    def _reader(self):
+        return GraniteConfigReconciliationTest._reader()
+
+    def test_head_dim_is_written_explicitly(self):
+        # Granite's own config omits head_dim, inviting everyone to derive
+        # hidden // heads. That is 2560/40 = 64 unpadded and 3072/40 = 76
+        # padded -- a wrong shape, not a wrong number.
+        from q4nx.model_assets import apply_granite_fold_to_config
+
+        cfg = GraniteConfigReconciliationTest._skeleton()
+        cfg.pop("head_dim", None)
+        apply_granite_fold_to_config(cfg, self._reader())
+        self.assertEqual(cfg["head_dim"], 64)
+        self.assertNotEqual(cfg["head_dim"], 3072 // 40)
+
+    def test_pad_writes_hidden_and_scales_eps(self):
+        from q4nx.model_assets import apply_granite_pad_to_config
+
+        cfg = GraniteConfigReconciliationTest._skeleton()
+        cfg["rms_norm_eps"] = 1e-5
+        apply_granite_pad_to_config(cfg, self._reader(), 3072)
+        self.assertEqual(cfg["hidden_size"], 3072)
+        self.assertAlmostEqual(cfg["rms_norm_eps"], 1e-5 * 2560 / 3072)
+        self.assertEqual(cfg["q4nx_padded_from_hidden"], 2560)
+
+    def test_no_pad_norm_fix_leaves_eps_alone_and_records_it(self):
+        from q4nx.model_assets import apply_granite_pad_to_config
+
+        cfg = GraniteConfigReconciliationTest._skeleton()
+        cfg["rms_norm_eps"] = 1e-5
+        apply_granite_pad_to_config(cfg, self._reader(), 3072, norm_fix=False)
+        self.assertEqual(cfg["rms_norm_eps"], 1e-5)
+        self.assertFalse(cfg["q4nx_pad_norm_fix"])
+
+    def test_padding_to_the_same_width_is_a_no_op(self):
+        from q4nx.model_assets import apply_granite_pad_to_config
+
+        cfg = GraniteConfigReconciliationTest._skeleton()
+        before = dict(cfg)
+        apply_granite_pad_to_config(cfg, self._reader(), 2560)
+        self.assertEqual(cfg, before)
+
+
+class GranitePadIntermediateTest(unittest.TestCase):
+    """--pad-intermediate widens the MLP so the weights fit a compiled design
+    whose feed-forward width differs. granite-4.2-8b is intermediate 12800
+    against the Llama-3.1-8B design's 14336, and every other dimension already
+    matches.
+
+    Unlike --pad-hidden this is exact with nothing to correct: no norm spans the
+    intermediate axis, so there is not even a bf16 rounding.
+    """
+
+    def test_gate_and_up_pad_on_rows_down_on_cols(self):
+        for name in ("model.layers.2.mlp.gate_proj.weight",
+                     "model.layers.2.mlp.up_proj.weight"):
+            self.assertTrue(Granite._endswith_any(name, Granite._PAD_INTER_ROWS), name)
+        self.assertTrue(
+            Granite._endswith_any("model.layers.2.mlp.down_proj.weight",
+                                  Granite._PAD_INTER_COLS))
+
+    def test_both_axes_can_be_padded_at_once(self):
+        # down_proj is hidden-rows by intermediate-cols, so padding hidden and
+        # intermediate together has to touch the same tensor twice.
+        d = torch.full((64, 4), 0.5)
+        m = torch.full((64, 4), -0.25)
+        qs = torch.full((64, 128), 3, dtype=torch.int8)
+        nd, nm, nq = Granite._pad_unpacked((d, m, qs), rows=96, cols=256)
+        self.assertEqual(nq.shape, (96, 256))
+        self.assertEqual(nd.shape, (96, 8))
+        self.assertTrue(torch.equal(nq[:64, :128], qs))
+        self.assertTrue(torch.all(nq[64:, :] == 0))
+        self.assertTrue(torch.all(nq[:, 128:] == 0))
+
+    def test_no_targets_is_a_no_op(self):
+        d = torch.full((4, 2), 0.5); m = torch.full((4, 2), -0.25)
+        qs = torch.full((4, 64), 3, dtype=torch.int8)
+        out = Granite._pad_unpacked((d, m, qs))
+        self.assertIs(out[2], qs)
+
+    def test_granite_4_2_8b_lands_on_the_llama_31_8b_design(self):
+        # The geometry that motivated this flag, asserted so a future change
+        # that breaks it is visible: everything matches but the MLP width.
+        granite_8b = dict(hidden=4096, heads=32, kv=8, head_dim=128, inter=12800)
+        llama_31_8b = dict(hidden=4096, heads=32, kv=8, head_dim=128, inter=14336)
+        for key in ("hidden", "heads", "kv", "head_dim"):
+            self.assertEqual(granite_8b[key], llama_31_8b[key], key)
+        self.assertNotEqual(granite_8b["inter"], llama_31_8b["inter"])
+        # and the gap is a whole number of 512-wide blocks, like nanbeige's
+        self.assertEqual((llama_31_8b["inter"] - granite_8b["inter"]) % 512, 0)

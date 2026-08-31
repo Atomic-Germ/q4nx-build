@@ -52,6 +52,33 @@ class Granite(Llama, model_arch=ModelArch.GRANITE):
     # keys, so both prefixes are searched.
     _ARCH_PREFIXES = ("granite", "llama")
 
+    # Set by --pad-hidden / --pad-intermediate / --no-pad-norm-fix. See _pad_plan.
+    pad_hidden: int | None = None
+    pad_intermediate: int | None = None
+    pad_norm_fix: bool = True
+
+    # Which axis of each tensor carries the hidden dimension. Names are q4nx
+    # names; matching is on suffix so it holds across layers.
+    _PAD_COLS = (  # hidden is the INPUT width
+        "self_attn.q_proj.weight", "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight", "mlp.gate_proj.weight",
+        "mlp.up_proj.weight", "lm_head.weight",
+    )
+    _PAD_ROWS = (  # hidden is the OUTPUT width
+        "self_attn.o_proj.weight", "mlp.down_proj.weight",
+    )
+    _NORMS = (
+        "input_layernorm.weight", "post_attention_layernorm.weight",
+        "model.norm.weight",
+    )
+    # Which axis of each tensor carries the INTERMEDIATE (MLP) dimension.
+    # Padding this axis is exact with nothing to correct: the padded lanes of
+    # gate/up are zero, `silu(0) * 0 = 0`, and down_proj's matching columns are
+    # zero too. No norm spans the intermediate axis, so unlike --pad-hidden
+    # there is not even a bf16 rounding.
+    _PAD_INTER_ROWS = ("mlp.gate_proj.weight", "mlp.up_proj.weight")
+    _PAD_INTER_COLS = ("mlp.down_proj.weight",)
+
     def _meta(self, suffix: str):
         """Read `<arch>.<suffix>` from the GGUF metadata, or None."""
         for prefix in self._ARCH_PREFIXES:
@@ -149,6 +176,105 @@ class Granite(Llama, model_arch=ModelArch.GRANITE):
                 return factor
         return None
 
+    def _pad_plan(self) -> tuple[int, int, float] | None:
+        """`(hidden, padded_hidden, norm_scale)`, or None when not padding.
+
+        Why this exists: `llama_npu.dll` does not accept an arbitrary hidden
+        size. It whitelists one, and the accepted set is exactly the hidden
+        sizes of the shipped llama-family designs -- {2048, 3072, 4096},
+        measured in NpuEmbeddings tasks/0144. Granite-4.2-3B is 2560 and is
+        refused outright with "Unsupported hidden size: 2560".
+
+        Widening the residual stream to the next accepted size is exact, not an
+        approximation, because every tensor that writes into the residual
+        stream gets zero rows and every tensor that reads from it gets zero
+        columns -- so the padded lanes are identically zero at every layer.
+
+        The one place that is NOT automatic is RMSNorm, which divides by
+        `sqrt(mean(x^2) + eps)` over the *full* width. Widening H -> H' shrinks
+        the mean by H/H'. Both terms are fixed by scaling:
+
+            norm weights *= sqrt(H / H')
+            rms_norm_eps *= H / H'
+
+        With `eps' = eps * H/H'` the denominator becomes
+        `sqrt((H/H')(S/H + eps))`, so the norm weight scale `sqrt(H/H')`
+        cancels it for every input rather than approximately.
+        (`rms_norm_eps` is written by `model_assets.apply_granite_pad_to_config`.)
+
+        Exact in real arithmetic, with **one** rounding in practice: the
+        rescaled norm weights are stored bf16, so they carry a relative error up
+        to bf16's epsilon. Measured against the unpadded build, that is
+        3.5e-03 max / 1.5e-03 mean against an epsilon of 3.9e-03, and it moves
+        the logits by cosine 1.5e-04 with the argmax unchanged -- an order of
+        magnitude below the Q4_1 weight floor the model already sits on. The
+        padded lanes themselves are exactly zero.
+
+        The cost is arithmetic on 512 lanes of zeros -- about 20% of the hidden
+        dimension -- in exchange for landing on a design that already exists.
+        """
+        if not self.pad_hidden:
+            return None
+        heads = self._meta("attention.head_count")
+        hidden = int(self._meta("embedding_length"))
+        target = int(self.pad_hidden)
+        if target == hidden:
+            return None
+        if target < hidden:
+            raise ValueError(
+                f"--pad-hidden {target} is smaller than the model's hidden size {hidden}"
+            )
+        if target % 256:
+            # A Q4NX tile is 32 rows x 256 K; a hidden size that is not a whole
+            # number of column-blocks would need partial tiles.
+            raise ValueError(f"--pad-hidden {target} is not a multiple of 256")
+        if not self.pad_norm_fix:
+            print("[WARN] --no-pad-norm-fix: RMSNorm's width term is NOT corrected. "
+                  "On a runtime that normalizes over the padded width every "
+                  "activation is scaled by sqrt(H'/H).")
+            return hidden, target, 1.0
+        return hidden, target, math.sqrt(hidden / target)
+
+    @staticmethod
+    def _pad_unpacked(unpacked, rows: int | None = None, cols: int | None = None):
+        """Zero-extend a tensor to `rows` x `cols` (None on an axis = leave it).
+
+        Both axes at once, because a tensor can need both: `down_proj` is
+        hidden-rows by intermediate-cols, so padding hidden and intermediate
+        together touches the same tensor twice.
+
+        Q4_1 groups are 32 wide and every width involved is a multiple of 32, so
+        the padding lands on whole groups: the added `d` and `m` are 0 and the
+        added codes are 0, giving `w = 0*0 + 0 = 0` exactly.
+        """
+        if len(unpacked) == 1:
+            w = unpacked[0]
+            if rows is not None:
+                raise ValueError("float passthrough tensors only pad on cols")
+            if cols is None:
+                return unpacked
+            out = torch.zeros((w.shape[0], cols), dtype=w.dtype)
+            out[:, : w.shape[1]] = w
+            return (out,)
+
+        d, m, qs = unpacked
+        n_rows = rows if rows is not None else qs.shape[0]
+        n_cols = cols if cols is not None else qs.shape[1]
+        if n_rows == qs.shape[0] and n_cols == qs.shape[1]:
+            return unpacked
+
+        nd = torch.zeros((n_rows, n_cols // 32), dtype=d.dtype)
+        nm = torch.zeros((n_rows, n_cols // 32), dtype=m.dtype)
+        nq = torch.zeros((n_rows, n_cols), dtype=qs.dtype)
+        nd[: d.shape[0], : d.shape[1]] = d
+        nm[: m.shape[0], : m.shape[1]] = m
+        nq[: qs.shape[0], : qs.shape[1]] = qs
+        return (nd, nm, nq)
+
+    @staticmethod
+    def _endswith_any(name: str, suffixes) -> bool:
+        return any(name.endswith(s) for s in suffixes)
+
     @staticmethod
     def _scale_unpacked(unpacked, factor: float):
         """Scale a tensor in whatever form `GGUFTensor.unpack` returned it.
@@ -168,6 +294,15 @@ class Granite(Llama, model_arch=ModelArch.GRANITE):
         print("[INFO] Converting granite model to Q4NX format...")
         folds = self._fold_factors()
         head_dim = self._head_dim()
+        pad = self._pad_plan()
+        if pad:
+            hidden, padded, norm_scale = pad
+            print(f"[INFO] Granite: padding hidden {hidden} -> {padded} "
+                  f"(norm weights *= {norm_scale:.9f}, rms_norm_eps *= {hidden/padded:.9f})")
+        if self.pad_intermediate:
+            inter = self._meta("feed_forward_length")
+            print(f"[INFO] Granite: padding intermediate {inter} -> "
+                  f"{int(self.pad_intermediate)} (exact; no norm spans this axis)")
 
         if not self._has_lm_head():
             # Tied embeddings. lm_head must come from the UNSCALED embedding
@@ -194,6 +329,11 @@ class Granite(Llama, model_arch=ModelArch.GRANITE):
                 factor = self._fold_factor_for(q4nx_name, folds)
                 if factor is not None:
                     w = (w.float() * factor).to(torch.bfloat16)
+                if pad:
+                    # embed_tokens is (vocab, hidden): hidden is the last axis.
+                    padded_w = torch.zeros((w.shape[0], pad[1]), dtype=w.dtype)
+                    padded_w[:, : w.shape[1]] = w
+                    w = padded_w
                 self.q4nx_tensors[q4nx_name] = w
                 continue
 
@@ -212,6 +352,32 @@ class Granite(Llama, model_arch=ModelArch.GRANITE):
             factor = self._fold_factor_for(q4nx_name, folds)
             if factor is not None:
                 unpacked = self._scale_unpacked(unpacked, factor)
+
+            if pad or self.pad_intermediate:
+                if pad and self._endswith_any(q4nx_name, self._NORMS):
+                    # RMSNorm: widen with zero weights and rescale so the wider
+                    # denominator cancels. See _pad_plan.
+                    _, padded, norm_scale = pad
+                    unpacked = self._scale_unpacked(unpacked, norm_scale)
+                    w = unpacked[0]
+                    grown = torch.zeros((padded,), dtype=w.dtype)
+                    grown[: w.shape[0]] = w.reshape(-1)
+                    unpacked = (grown,)
+                else:
+                    rows = cols = None
+                    if pad:
+                        padded = pad[1]
+                        if self._endswith_any(q4nx_name, self._PAD_COLS):
+                            cols = padded
+                        elif self._endswith_any(q4nx_name, self._PAD_ROWS):
+                            rows = padded
+                    if self.pad_intermediate:
+                        if self._endswith_any(q4nx_name, self._PAD_INTER_ROWS):
+                            rows = int(self.pad_intermediate)
+                        elif self._endswith_any(q4nx_name, self._PAD_INTER_COLS):
+                            cols = int(self.pad_intermediate)
+                    if rows is not None or cols is not None:
+                        unpacked = self._pad_unpacked(unpacked, rows, cols)
 
             self.q4nx_tensors[q4nx_name] = self._pack_q4nx(*unpacked)
 

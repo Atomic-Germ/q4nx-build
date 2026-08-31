@@ -829,6 +829,14 @@ def apply_granite_fold_to_config(config: dict, reader) -> dict:
     }
     original = {k: float(v) for k, v in original.items() if v is not None}
 
+    # Write head_dim explicitly. Granite's own config.json omits it, leaving
+    # every consumer to derive `hidden_size // num_attention_heads`. That is
+    # true for an unpadded model and FALSE the moment --pad-hidden widens the
+    # residual stream: 3072 // 40 = 76, not 64, and the wrong head_dim gives
+    # wrong tensor shapes rather than a wrong number, so it fails loudly in
+    # some places and silently in others.
+    config["head_dim"] = head_dim
+
     config["attention_multiplier"] = head_dim ** -0.5
     config["embedding_multiplier"] = 1.0
     config["residual_multiplier"] = 1.0
@@ -845,6 +853,43 @@ def apply_granite_fold_to_config(config: dict, reader) -> dict:
         print(f"[INFO] Granite: tie_word_embeddings "
               f"{config.get('tie_word_embeddings')} -> {not has_output} (from GGUF tensors)")
         config["tie_word_embeddings"] = not has_output
+    return config
+
+
+def apply_granite_pad_to_config(config: dict, reader, padded_hidden: int,
+                                norm_fix: bool = True) -> dict:
+    """Declare the padded width, and correct RMSNorm's epsilon for it.
+
+    Widening the residual stream is only exact if the config says so. Two keys
+    have to move together with the weights:
+
+      hidden_size   -> the padded width, or the engine reads the wrong stride
+      rms_norm_eps  -> scaled by H/H'
+
+    The epsilon is the half that is easy to miss. RMSNorm divides by
+    `sqrt(mean(x^2) + eps)` over the full width; widening H -> H' shrinks
+    `mean(x^2)` by exactly H/H', so scaling `eps` by the same factor makes the
+    whole radicand scale by H/H' and the `sqrt(H/H')` folded into the norm
+    weights cancel it for every input. Scale only the weights and the epsilon
+    term is left over -- small, but a real error, and one no shape check sees.
+    """
+    arch = _gguf_field(reader, "general.architecture")
+    hidden = int(_gguf_field(reader, f"{arch}.embedding_length"))
+    if padded_hidden == hidden:
+        return config
+
+    config["hidden_size"] = padded_hidden
+    ratio = hidden / padded_hidden
+    config["q4nx_padded_from_hidden"] = hidden
+    if norm_fix:
+        eps = float(config.get("rms_norm_eps", 1e-5))
+        config["rms_norm_eps"] = eps * ratio
+        print(f"[INFO] Granite: hidden_size -> {padded_hidden}, "
+              f"rms_norm_eps {eps} -> {config['rms_norm_eps']} (x {ratio:.9f})")
+    else:
+        config["q4nx_pad_norm_fix"] = False
+        print(f"[INFO] Granite: hidden_size -> {padded_hidden}, "
+              f"rms_norm_eps left uncorrected (--no-pad-norm-fix)")
     return config
 
 
@@ -1170,6 +1215,8 @@ def assemble_model_assets(
     flm_version: Optional[str] = None,
     source_file: Optional[str] = None,
     model_arch: Optional[ModelArch] = None,
+    pad_hidden: Optional[int] = None,
+    pad_norm_fix: bool = True,
 ) -> None:
     """Build a complete, uploadable model directory.
 
@@ -1213,6 +1260,8 @@ def assemble_model_assets(
     reconcile_config_with_gguf(config, reader, model_arch)
     if model_arch == ModelArch.GRANITE:
         apply_granite_fold_to_config(config, reader)
+        if pad_hidden:
+            apply_granite_pad_to_config(config, reader, pad_hidden, pad_norm_fix)
 
     if model_arch in QWEN35_VISION_ARCHS:
         _ensure_qwen35_vision_weight(q4nx_config, output_dir, [source_model, *candidates])

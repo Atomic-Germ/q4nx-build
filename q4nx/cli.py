@@ -85,6 +85,29 @@ def _parse_args(argv):
              "fit the compiled variant (padded channels are inert).",
     )
     parser.add_argument(
+        "--pad-hidden", dest="pad_hidden", type=int, default=None, metavar="N",
+        help="Zero-pad the hidden (residual) axis up to N. The llama engine "
+             "accepts only hidden sizes it has a compiled design for "
+             "({2048, 3072, 4096}); a model between two of them can be widened "
+             "onto the next. Padded lanes stay identically zero and RMSNorm's "
+             "width term is corrected; the only loss is one bf16 rounding of "
+             "the rescaled norm weights.",
+    )
+    parser.add_argument(
+        "--pad-intermediate", dest="pad_intermediate", type=int, default=None,
+        metavar="N",
+        help="Zero-pad the MLP (intermediate) axis up to N, so the weights fit "
+             "a compiled design whose feed-forward width differs. Exact: the "
+             "padded lanes of gate/up are zero, silu(0)*0 = 0, and down_proj's "
+             "matching columns are zero, and no norm spans this axis.",
+    )
+    parser.add_argument(
+        "--no-pad-norm-fix", dest="pad_norm_fix", action="store_false",
+        help="Pad the hidden axis WITHOUT correcting RMSNorm's width term. "
+             "Incorrect on a runtime that normalizes over the padded width; "
+             "kept so the two can be told apart on hardware.",
+    )
+    parser.add_argument(
         "--flm-version", dest="flm_version", default=None, help="flm_version to write into config.json"
     )
     parser.add_argument(
@@ -213,6 +236,9 @@ def main(argv=None) -> int:
     else:
         model = create_converter(input_path, args.force_model_type)
         model.pad_to_fit = args.pad_to_fit
+        model.pad_hidden = args.pad_hidden
+        model.pad_intermediate = args.pad_intermediate
+        model.pad_norm_fix = args.pad_norm_fix
         if weights_type == "vision":
             model.convert(q4nx_path=output_folder, weights_type="language")
             model.convert(q4nx_path=output_folder, weights_type="vision")
@@ -226,6 +252,8 @@ def main(argv=None) -> int:
             flm_version=flm_version,
             source_file=source_file,
             model_arch=model.model_arch,
+            pad_hidden=args.pad_hidden,
+            pad_norm_fix=args.pad_norm_fix,
         )
 
     if args.deploy_tag:
