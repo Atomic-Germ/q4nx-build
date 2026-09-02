@@ -186,6 +186,22 @@ FAMILY_PROFILES: Tuple[FamilyProfile, ...] = (
         "from Qwen3's q_norm/k_norm) and post_ffn_norm.",
     ),
     FamilyProfile(
+        arch=ModelArch.GRANITE,
+        family="granite",
+        keywords=("granite",),
+        excludes=(
+            "q_norm", "k_norm", "ssm_", "shortconv", "ffn_gate_exps",
+            "ffn_gate_inp", "post_ffn_norm", "vision_patch_embd",
+        ),
+        field_prefixes=("granite.",),
+        notes="IBM Granite dense (granite-4.x). Tensor names are identical to "
+        "Llama's -- the difference is four scalar multipliers in the GGUF "
+        "metadata (granite.attention.scale, .embedding_scale, .residual_scale, "
+        "granite.logit_scale), which the converter folds into the weights. Told "
+        "apart only by general.architecture / basename / field prefix. The "
+        "excludes keep granitemoe and granitehybrid off this dense family.",
+    ),
+    FamilyProfile(
         arch=ModelArch.LLAMA,
         family="llama3.2",
         keywords=("llama", "meta-llama", "nemotron"),
@@ -543,6 +559,7 @@ ARCH_TO_FAMILY: Dict[ModelArch, str] = {
     ModelArch.PHI4: "phi4",
     ModelArch.GPT_OSS: "gpt-oss",
     ModelArch.NANBEIGE: "nanbeige",
+    ModelArch.GRANITE: "granite",
 }
 
 

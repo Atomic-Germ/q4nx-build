@@ -734,6 +734,165 @@ def generate_config_from_gguf(reader) -> dict:
     return cfg
 
 
+def reconcile_config_with_gguf(config: dict, reader, model_arch=None) -> dict:
+    """Check a skeleton `config.json` against the GGUF actually being converted.
+
+    The skeleton is fetched by following `general.base_model.*.repo_url`, which
+    names the model this one was TRAINED FROM, not this model. Usually those
+    agree on everything that matters. Sometimes they do not, and the failure is
+    silent: `ibm-granite/granite-4.2-3b`'s GGUF points at
+    `ibm-granite/granite-4.1-3b-base`, whose config carries
+    `embedding_multiplier 12.0`, `logits_scaling 10.0`,
+    `residual_multiplier 0.22` and `tie_word_embeddings true` against 4.2's
+    1.0/1.0/1.0/false. Every dimension matched, so nothing complained and the
+    emitted directory described a different checkpoint than it contained.
+
+    Dimensions are only WARNED about, never rewritten: some families
+    deliberately publish a padded `intermediate_size` (nanbeige pads
+    ffn_down/up/gate to a multiple of 512) that the GGUF does not carry, and
+    overwriting from the GGUF would break them.
+    """
+    def _differs(had, want) -> bool:
+        # config.json holds JSON doubles; the GGUF holds float32. A round-trip
+        # of 1e-5 reads back as 9.999999747378752e-06 -- the same number, and
+        # not worth a warning. Noisy warnings train people to ignore them.
+        if isinstance(had, float) or isinstance(want, float):
+            try:
+                scale = max(abs(float(had)), abs(float(want)), 1e-30)
+                return abs(float(had) - float(want)) / scale > 1e-6
+            except (TypeError, ValueError):
+                return True
+        return had != want
+
+    truth = generate_config_from_gguf(reader)
+    mismatches = []
+    for key, value in truth.items():
+        if key == "model_type":
+            continue
+        if key in config and _differs(config[key], value):
+            mismatches.append((key, config[key], value))
+
+    # Token ids are unambiguous -- nothing pads or derives them -- so unlike the
+    # dimensions these are corrected rather than only reported. The runtime reads
+    # them from tokenizer_config.json (ensure_runtime_tokenizer_ids handles that
+    # one), but a config.json carrying the base model's ids is still wrong.
+    for key, field in (("bos_token_id", "tokenizer.ggml.bos_token_id"),
+                       ("eos_token_id", "tokenizer.ggml.eos_token_id"),
+                       ("pad_token_id", "tokenizer.ggml.padding_token_id")):
+        want = _gguf_field(reader, field)
+        if want is None or key not in config:
+            continue
+        want = int(want)
+        had = config[key]
+        if isinstance(had, list):
+            if want in had:
+                continue
+        elif had == want:
+            continue
+        print(f"[INFO] {key}: {had} -> {want} (from GGUF metadata)")
+        config[key] = want
+
+    if mismatches:
+        print("[WARN] Skeleton config disagrees with the GGUF being converted;")
+        print("[WARN] the skeleton is the BASE model, which may be a different checkpoint.")
+        for key, had, want in mismatches:
+            print(f"[WARN]   {key}: config.json says {had}, GGUF says {want}")
+        print("[WARN] Dimensions left as-is (some families publish padded values).")
+    return config
+
+
+def apply_granite_fold_to_config(config: dict, reader) -> dict:
+    """Make a Granite config describe the FOLDED weights that were written.
+
+    `q4nx/models/granite.py` folds Granite's four multipliers into the weights,
+    because nothing in the FLM runtime reads them. After folding, the file no
+    longer holds Granite-scaled weights -- it holds Llama-scaled ones. The
+    config has to say so, or anything that trusts it (transformers, a reader
+    checking provenance) applies the multipliers a second time.
+
+    So the emitted values are the POST-fold ones: `attention_multiplier` becomes
+    the stock `head_dim ** -0.5` that the llama engine applies, and the other
+    three become 1.0. The originals are kept under `q4nx_folded_multipliers` so
+    the conversion stays auditable.
+    """
+    arch = _gguf_field(reader, "general.architecture")
+    heads = _gguf_field(reader, f"{arch}.attention.head_count")
+    hidden = _gguf_field(reader, f"{arch}.embedding_length")
+    rope_dim = _gguf_field(reader, f"{arch}.rope.dimension_count")
+    head_dim = int(rope_dim) if rope_dim else int(hidden) // int(heads)
+
+    original = {
+        "attention_multiplier": _gguf_field(reader, f"{arch}.attention.scale"),
+        "embedding_multiplier": _gguf_field(reader, f"{arch}.embedding_scale"),
+        "residual_multiplier": _gguf_field(reader, f"{arch}.residual_scale"),
+        "logits_scaling": _gguf_field(reader, f"{arch}.logit_scale"),
+    }
+    original = {k: float(v) for k, v in original.items() if v is not None}
+
+    # Write head_dim explicitly. Granite's own config.json omits it, leaving
+    # every consumer to derive `hidden_size // num_attention_heads`. That is
+    # true for an unpadded model and FALSE the moment --pad-hidden widens the
+    # residual stream: 3072 // 40 = 76, not 64, and the wrong head_dim gives
+    # wrong tensor shapes rather than a wrong number, so it fails loudly in
+    # some places and silently in others.
+    config["head_dim"] = head_dim
+
+    config["attention_multiplier"] = head_dim ** -0.5
+    config["embedding_multiplier"] = 1.0
+    config["residual_multiplier"] = 1.0
+    config["logits_scaling"] = 1.0
+    if original:
+        config["q4nx_folded_multipliers"] = original
+        print(f"[INFO] Granite: config rewritten to describe the folded weights "
+              f"(attention_multiplier -> {config['attention_multiplier']}); "
+              f"originals kept under q4nx_folded_multipliers")
+
+    # The GGUF is authoritative on whether lm_head is its own tensor.
+    has_output = any(t.name == "output.weight" for t in reader.tensors)
+    if config.get("tie_word_embeddings") != (not has_output):
+        print(f"[INFO] Granite: tie_word_embeddings "
+              f"{config.get('tie_word_embeddings')} -> {not has_output} (from GGUF tensors)")
+        config["tie_word_embeddings"] = not has_output
+    return config
+
+
+def apply_granite_pad_to_config(config: dict, reader, padded_hidden: int,
+                                norm_fix: bool = True) -> dict:
+    """Declare the padded width, and correct RMSNorm's epsilon for it.
+
+    Widening the residual stream is only exact if the config says so. Two keys
+    have to move together with the weights:
+
+      hidden_size   -> the padded width, or the engine reads the wrong stride
+      rms_norm_eps  -> scaled by H/H'
+
+    The epsilon is the half that is easy to miss. RMSNorm divides by
+    `sqrt(mean(x^2) + eps)` over the full width; widening H -> H' shrinks
+    `mean(x^2)` by exactly H/H', so scaling `eps` by the same factor makes the
+    whole radicand scale by H/H' and the `sqrt(H/H')` folded into the norm
+    weights cancel it for every input. Scale only the weights and the epsilon
+    term is left over -- small, but a real error, and one no shape check sees.
+    """
+    arch = _gguf_field(reader, "general.architecture")
+    hidden = int(_gguf_field(reader, f"{arch}.embedding_length"))
+    if padded_hidden == hidden:
+        return config
+
+    config["hidden_size"] = padded_hidden
+    ratio = hidden / padded_hidden
+    config["q4nx_padded_from_hidden"] = hidden
+    if norm_fix:
+        eps = float(config.get("rms_norm_eps", 1e-5))
+        config["rms_norm_eps"] = eps * ratio
+        print(f"[INFO] Granite: hidden_size -> {padded_hidden}, "
+              f"rms_norm_eps {eps} -> {config['rms_norm_eps']} (x {ratio:.9f})")
+    else:
+        config["q4nx_pad_norm_fix"] = False
+        print(f"[INFO] Granite: hidden_size -> {padded_hidden}, "
+              f"rms_norm_eps left uncorrected (--no-pad-norm-fix)")
+    return config
+
+
 def generate_tokenizer_config(reader) -> dict:
     """Minimal tokenizer_config.json the FLM runtime can parse (no-source fallback)."""
     cfg: dict = {}
@@ -1056,6 +1215,8 @@ def assemble_model_assets(
     flm_version: Optional[str] = None,
     source_file: Optional[str] = None,
     model_arch: Optional[ModelArch] = None,
+    pad_hidden: Optional[int] = None,
+    pad_norm_fix: bool = True,
 ) -> None:
     """Build a complete, uploadable model directory.
 
@@ -1095,6 +1256,12 @@ def assemble_model_assets(
         print("[WARN] No source model found; generating config.json from GGUF metadata.")
         print("[WARN] tokenizer files may not exactly match the official model.")
         config = generate_config_from_gguf(reader)
+
+    reconcile_config_with_gguf(config, reader, model_arch)
+    if model_arch == ModelArch.GRANITE:
+        apply_granite_fold_to_config(config, reader)
+        if pad_hidden:
+            apply_granite_pad_to_config(config, reader, pad_hidden, pad_norm_fix)
 
     if model_arch in QWEN35_VISION_ARCHS:
         _ensure_qwen35_vision_weight(q4nx_config, output_dir, [source_model, *candidates])
