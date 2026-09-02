@@ -58,6 +58,15 @@ When `-i` names an HF repo, `q4nx-build` fills in the rest from the repo's own m
 q4nx-build -i numind/NuExtract3-GGUF
 ```
 
+A local **model card** works too — a directory containing just a `README.md`, or a `.md`
+file path. The card body is mined for the upstream repo id (from_pretrained / vllm / ollama
+mentions), which then feeds the same derivation:
+
+```bash
+q4nx-build -i ./GRaPE-1.5
+# [INFO] Card names upstream repo: Sweaterdog/GRaPE-1.5
+```
+
 1. **Base chain** — it follows the `base_model` frontmatter up the tree
    (`numind/NuExtract3-GGUF -> numind/NuExtract3 -> Qwen/Qwen3.5-4B -> ...`) and stops at the first
    ancestor with a `{org}/{base}-NPU2` mirror. Orgs are tried in order: **Atomic-Germ**, then **FastFlowLM**.

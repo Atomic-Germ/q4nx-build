@@ -14,6 +14,7 @@ Every network touch is optional: offline or private-repo failures degrade to a
 """
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
@@ -215,6 +216,252 @@ def weights_type_reason(card: dict) -> str:
 
 def format_chain(chain: List[str]) -> str:
     return " -> ".join(chain)
+
+
+def display_name_for_arch(arch) -> Optional[str]:
+    """Official-style base name for an arch whose name carries a size token.
+
+    QWEN35_4B -> 'Qwen3.5-4B' (matches the {org}/{base}-NPU2 mirror naming).
+    Returns None when the arch name has no size segment (plain 'qwen3',
+    'gemma4', ...) because the resulting mirror name would be a guess.
+    """
+    from .constants import ModelArchNames
+
+    names = ModelArchNames.get(arch) or []
+    if not names:
+        return None
+    best = max(names, key=len)
+    segments = re.split(r"[-_]", best)
+    has_size = any(
+        re.fullmatch(r"\d+(?:\.\d+)?b(?:-a\d+b)?|e\d+b", seg, re.IGNORECASE)
+        for seg in segments
+    )
+    if not has_size:
+        return None
+    return "-".join(seg[:1].upper() + seg[1:] if seg[:1].isalpha() else seg for seg in segments)
+
+
+def find_skeleton_for_arch(
+    arch,
+    orgs: List[str] = SKELETON_ORGS,
+    probe: Callable[[str], bool] = _skeleton_exists,
+) -> Optional[str]:
+    """Skeleton mirror guessed from the architecture alone (no chain needed).
+
+    Used when a repo declares no base_model anywhere: its config.json still
+    reveals family+size, which maps to the same {org}/{base}-NPU2 convention.
+    """
+    display = display_name_for_arch(arch)
+    if not display:
+        return None
+    for org in orgs:
+        candidate = f"{org}/{display}{SKELETON_SUFFIX}"
+        if probe(candidate):
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Local README.md card parsing (-i <dir-with-README> / -i <file>.md)
+# ---------------------------------------------------------------------------
+
+_REPO_ID_RE = re.compile(
+    r"(?:^|[\s\"'`(=])([A-Za-z][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)(?=[\s\"'`,.:;)\]]|$)"
+)
+# Code and CLI references rank a raw mention higher.
+_REPO_ID_CONTEXT_RE = re.compile(
+    r"(?:from_pretrained|AutoProcessor|AutoTokenizer|vllm serve|ollama run|"
+    r"huggingface\.co/|hf\.co/|resolve/main)",
+)
+_NON_REPO_HINTS = ("cdn-uploads", "opensource.org", "img.shields.io", "github.com")
+
+
+def parse_readme_frontmatter(text: str) -> dict:
+    """Minimal YAML-frontmatter subset: flat keys plus simple lists.
+
+    Tries PyYAML first (a transitive dep of huggingface_hub); falls back to a
+    line-based parser that handles `key: value` and `- item` blocks, which is
+    all model-card frontmatter needs.
+    """
+    stripped = text.lstrip("\ufeff \t\r\n")
+    if not stripped.startswith("---"):
+        return {}
+    end = stripped.find("\n---", 3)
+    if end == -1:
+        return {}
+    block = stripped[3:end]
+    try:
+        import yaml  # type: ignore
+
+        data = yaml.safe_load(block)
+        return dict(data) if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    data: dict = {}
+    current_key = None
+    for line in block.splitlines():
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        if line.startswith(("  ", "\t", "-")):
+            item = line.strip().lstrip("-").strip()
+            if current_key is not None and item:
+                data.setdefault(current_key, [])
+                if isinstance(data[current_key], list):
+                    data[current_key].append(item)
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if value == "":
+            data[key] = []
+            current_key = key
+        else:
+            data[key] = value.strip("'\"")
+            current_key = None
+    return data
+
+
+def extract_repo_ids(text: str) -> List[str]:
+    """Rank org/name candidates mentioned in a model card body.
+
+    Code snippets (from_pretrained/vllm/ollama) and links are strong signals;
+    frequency breaks ties. URL-host strings (shields, cdn) are excluded.
+    """
+    scores: Counter = Counter()
+    for match in _REPO_ID_RE.finditer(text):
+        repo_id = match.group(1).strip(".,;")
+        lowered = repo_id.lower()
+        if any(hint in lowered for hint in _NON_REPO_HINTS):
+            continue
+        # org/name only; skip file paths like `very_long_document.txt/x`
+        weight = 2 if _REPO_ID_CONTEXT_RE.search(text[max(0, match.start() - 40): match.end() + 40]) else 1
+        scores[repo_id] += weight
+    # Prefer the most-mentioned spelling but keep variants (case differences).
+    ranked = [repo for repo, _ in scores.most_common()]
+    return ranked
+
+
+_PARAM_SIZE_RE = re.compile(
+    r"(?:\bparams?(?:eters)?\s*[:=-]?\s*)?(\d+(?:\.\d+)?)\s*[bB]\b"
+    r"|(\d+(?:\.\d+)?)\s*[- ]?billion\b",
+)
+
+
+def extract_param_size(text: str) -> Optional[str]:
+    """Parameter-count claim from badge/text mentions ('4B', '4-billion')."""
+    m = re.search(r"Parameters[-–]\s*(\d+(?:\.\d+)?)\s*B\b", text)
+    if m:
+        return m.group(1) + "B"
+    m = re.search(r"\b(\d+(?:\.\d+)?)\s*[- ]?billion[- ]parameter", text, re.IGNORECASE)
+    if m:
+        return m.group(1) + "B"
+    m = re.search(r"\b(\d+(?:\.\d+)?)\s*B\s+(?:param|model)", text, re.IGNORECASE)
+    if m:
+        return m.group(1) + "B"
+    return None
+
+
+def canonicalize_repo_id(repo_id: str) -> Optional[str]:
+    """Resolve casing/prefix to the canonical HF id; None when unreachable."""
+    info = _model_info(repo_id)
+    if info is None:
+        return None
+    canonical = getattr(info, "id", None) or getattr(info, "modelId", None)
+    return canonical or repo_id
+
+
+def derive_build_plan_from_card(
+    path: str,
+    orgs: List[str] = SKELETON_ORGS,
+    fetch: Callable[[str], dict] = fetch_card,
+    probe: Callable[[str], bool] = _skeleton_exists,
+    canonicalize: Callable[[str], Optional[str]] = canonicalize_repo_id,
+) -> BuildPlan:
+    """Derive a build plan from a local model card (directory or README file).
+
+    The card itself supplies frontmatter (pipeline tag, tags, base_model);
+    the body usually names the upstream repo id one or more times. That id is
+    canonicalized against the Hub so the normal chain walk, skeleton lookup
+    and name derivation apply as if the user had passed `-i <repo-id>`.
+    """
+    readme_path = path
+    if os.path.isdir(path):
+        readme_path = os.path.join(path, "README.md")
+        if not os.path.isfile(readme_path):
+            raise FileNotFoundError(f"No README.md in {path}")
+    with open(readme_path, encoding="utf-8") as f:
+        text = f.read()
+
+    frontmatter = parse_readme_frontmatter(text)
+    display_hint = str(frontmatter.get("model_name") or "").strip()
+    pipeline_tag = frontmatter.get("pipeline_tag")
+    local_bases = normalize_base_models(frontmatter.get("base_model"))
+
+    candidates = extract_repo_ids(text)
+    plan = BuildPlan(repo_id="")
+    primary = None
+    for cand in candidates:
+        canonical = canonicalize(cand)
+        if canonical:
+            primary = canonical
+            break
+    if primary is None and candidates:
+        # Offline or unreachable: trust the most-mentioned spelling.
+        primary = candidates[0]
+        print(f"[WARN] Could not verify {primary} on the Hub; using it as-is")
+    if primary is None and len(local_bases) == 1:
+        # A frontmatter base_model with no body mention: treat it as the subject.
+        primary = local_bases[0]
+
+    card: Dict = {
+        "base_model": frontmatter.get("base_model"),
+        "model_name": frontmatter.get("model_name"),
+        "pipeline_tag": pipeline_tag,
+        "tags": frontmatter.get("tags") or [],
+    }
+
+    plan.repo_id = primary or ""
+    plan.pipeline_tag = pipeline_tag
+    plan.weights_type = infer_weights_type(card)
+    plan.weights_reason = weights_type_reason(card)
+
+    if primary:
+        cache: Dict[str, dict] = {}
+        remote_card = fetch(primary)
+        cache[primary] = remote_card
+        remote_chain = walk_base_chain(primary, cache=cache, fetch=fetch)
+        if len(remote_chain) > 1:
+            plan.chain = remote_chain
+            plan.skeleton = find_skeleton(plan.chain, orgs, probe)
+        else:
+            # Remote card declares nothing either; seed the chain with any
+            # locally-declared base_model before giving up.
+            plan.chain = [primary] + local_bases
+            plan.skeleton = find_skeleton(plan.chain, orgs, probe) if local_bases else None
+
+    if not display_hint:
+        if os.path.isdir(path):
+            display_hint = os.path.basename(os.path.abspath(path))
+        elif plan.repo_id:
+            display_hint = os.path.basename(plan.repo_id)
+        else:
+            display_hint = "Model"
+    plan.display_name = derive_display_name(
+        {"model_name": display_hint}, plan.repo_id or display_hint
+    )
+    if not plan.size_token and plan.skeleton:
+        plan.size_token = parse_size_token(os.path.basename(plan.skeleton))
+    if not plan.size_token:
+        plan.size_token = extract_param_size(text)
+    parts = [plan.display_name or "Model"]
+    if plan.size_token and plan.size_token.lower() not in {
+        seg.lower() for seg in (plan.display_name or "").split("-")
+    }:
+        parts.append(plan.size_token)
+    plan.output_name = "-".join(parts) + SKELETON_SUFFIX
+    return plan
 
 
 def derive_build_plan(
